@@ -1,0 +1,46 @@
+[package]
+name = "swap-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+bs58 = "0.5"
+base64 = "0.21"
+rand = "0.8"
+aes-gcm = "0.10"
+x25519-dalek = "2.0.1"
+hkdf = "0.12"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+prometheus-client = "0.22"
+ipnet = "2.11.0"
+
+solana-client = "2.0.0"
+solana-sdk = "2.0.0"
+solana-transaction-status = "2.0"
+
+sha2 = "0.10"
+borsh = "0.10.4"
+borsh-derive = "0.10.4"
+
+# Pyth (classic on-chain price accounts).
+# We intentionally parse the account bytes ourselves (stable v2 layout) to avoid
+# SDK dependency conflicts across Solana crate versions.
+
+# Hermes HTTP (Pyth price service)
+reqwest = { version = "0.12", default-features = true, features = ["json", "rustls-tls"] }
+
+[workspace]
+
+

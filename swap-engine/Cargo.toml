@@ -34,12 +34,19 @@ sha2 = "0.10"
 borsh = "0.10.4"
 borsh-derive = "0.10.4"
 
+# Solana pulls in `openssl` via secp256r1 precompile support; enable vendored OpenSSL so
+# local dev/CI doesn't require system OpenSSL + pkg-config.
+openssl = { version = "0.10", features = ["vendored"] }
+
 # Pyth (classic on-chain price accounts).
 # We intentionally parse the account bytes ourselves (stable v2 layout) to avoid
 # SDK dependency conflicts across Solana crate versions.
 
 # Hermes HTTP (Pyth price service)
-reqwest = { version = "0.12", default-features = true, features = ["json", "rustls-tls"] }
+# Use Rustls TLS to avoid system OpenSSL dependency (more portable for dev/CI).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+subtle = "2"
 
 [workspace]
 

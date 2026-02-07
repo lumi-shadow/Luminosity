@@ -80,9 +80,27 @@ impl RateLimiter {
         let cutoff = now_ms.saturating_sub(self.idle_evict_ms);
         self.ok.retain(|_, e| e.last_seen_ms >= cutoff);
         self.bad.retain(|_, e| e.last_seen_ms >= cutoff);
-        if self.ok.len() + self.bad.len() > self.max_entries * 2 {
-            self.ok.clear();
-            self.bad.clear();
+        // Hard cap: evict oldest entries (do NOT clear all; that resets limits and enables bypass).
+        let total = self.ok.len() + self.bad.len();
+        if total <= self.max_entries {
+            return;
+        }
+        // Remove oldest entries until within cap.
+        let mut all: Vec<(u128, bool, IpAddr)> = Vec::with_capacity(total);
+        for (ip, e) in self.ok.iter() {
+            all.push((e.last_seen_ms, true, *ip)); // true => ok map
+        }
+        for (ip, e) in self.bad.iter() {
+            all.push((e.last_seen_ms, false, *ip)); // false => bad map
+        }
+        all.sort_by_key(|(ts, _, _)| *ts);
+        let to_remove = all.len().saturating_sub(self.max_entries);
+        for (_, is_ok, ip) in all.into_iter().take(to_remove) {
+            if is_ok {
+                self.ok.remove(&ip);
+            } else {
+                self.bad.remove(&ip);
+            }
         }
     }
 
@@ -107,24 +125,18 @@ impl RateLimiter {
     }
 }
 
-pub fn rate_limit_ok(st: &crate::state::AppState, ip: IpAddr) -> Result<(), AppError> {
+pub async fn rate_limit_ok(st: &crate::state::AppState, ip: IpAddr) -> Result<(), AppError> {
     let now = crate::utils::now_ms();
-    let mut rl = st
-        .rate_limiter
-        .lock()
-        .map_err(|_| AppError::Unavailable("rate limiter lock poisoned".into()))?;
+    let mut rl = st.rate_limiter.lock().await;
     if !rl.allow_ok(ip, now) {
         return Err(AppError::TooManyRequests("rate limit exceeded".into()));
     }
     Ok(())
 }
 
-pub fn rate_limit_bad(st: &crate::state::AppState, ip: IpAddr) -> Result<(), AppError> {
+pub async fn rate_limit_bad(st: &crate::state::AppState, ip: IpAddr) -> Result<(), AppError> {
     let now = crate::utils::now_ms();
-    let mut rl = st
-        .rate_limiter
-        .lock()
-        .map_err(|_| AppError::Unavailable("rate limiter lock poisoned".into()))?;
+    let mut rl = st.rate_limiter.lock().await;
     if !rl.allow_bad(ip, now) {
         return Err(AppError::TooManyRequests("too many bad requests".into()));
     }

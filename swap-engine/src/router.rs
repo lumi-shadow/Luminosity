@@ -2,13 +2,42 @@ use crate::auth;
 use crate::allowlist;
 use crate::handlers;
 use crate::state::AppState;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request};
 use axum::routing::{get, post};
-use axum::{middleware, Router};
+use axum::{
+    http::StatusCode,
+    middleware,
+    middleware::Next,
+    response::IntoResponse,
+    Json,
+    Router,
+};
+use std::net::{IpAddr, SocketAddr};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on")
+        })
+        .unwrap_or(default)
+}
+
 pub fn build(state: AppState) -> Router {
+    // Public routes are intended to be reached via a trusted proxy (Next.js API routes).
+    // We enforce an optional IP allowlist at the HTTP boundary:
+    //
+    // - When `SWAP_ENGINE_ALLOWLIST_ONLY=true`, requests are rejected unless:
+    //   - connect-info is available, AND
+    //   - the peer IP is in the allowlist.
+    //   This supports a bootstrap flow where the trusted proxy can self-register via:
+    //     POST /admin/allowlist/self  (admin token required; NOT behind this middleware)
+    //
+    // - When allowlist-only is disabled, an empty allowlist is treated as "allow all" (default dev UX).
+    let allowlist_mw_state = state.clone();
     let public_routes = Router::new()
         .route("/health", get(handlers::public::health))
         .route("/health/solvency", get(handlers::public::health_solvency))
@@ -17,10 +46,73 @@ pub fn build(state: AppState) -> Router {
         .route("/quote", post(handlers::public::quote))
         .route("/execute", post(handlers::public::execute))
         .route("/execute-job", post(handlers::public::execute_job))
-        .route("/job/:id", get(handlers::jobs::job_status));
-    // NOTE: IP allowlist middleware is temporarily disabled to avoid bricking the service
-    // when running without connect-info or when allowlist is unset.
-    // (Admin endpoints remain protected by the admin token middleware.)
+        .route("/job/:id", get(handlers::jobs::job_status))
+        // Enforce allowlist on *public* endpoints only.
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let st = allowlist_mw_state.clone();
+            async move {
+                let allowlist_only = env_bool("SWAP_ENGINE_ALLOWLIST_ONLY", false);
+
+                let ip: Option<IpAddr> = req
+                    .extensions()
+                    .get::<SocketAddr>()
+                    .map(|peer| peer.ip())
+                    .or_else(|| {
+                        req.extensions()
+                            .get::<ConnectInfo<SocketAddr>>()
+                            .map(|ConnectInfo(peer)| peer.ip())
+                    });
+                let ip = match ip {
+                    Some(ip) => ip,
+                    None => {
+                        if allowlist_only {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(crate::types::ErrorBody {
+                                    error: "connect info missing (allowlist-only)".into(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        return next.run(req).await;
+                    }
+                };
+
+                let allowed = match st.allowlist.read() {
+                    Ok(nets) => {
+                        if allowlist_only {
+                            !nets.is_empty() && nets.iter().any(|n| n.contains(&ip))
+                        } else {
+                            nets.is_empty() || nets.iter().any(|n| n.contains(&ip))
+                        }
+                    }
+                    Err(_) => {
+                        if allowlist_only {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(crate::types::ErrorBody {
+                                    error: "allowlist lock poisoned (allowlist-only)".into(),
+                                }),
+                            )
+                                .into_response();
+                        }
+                        true
+                    }
+                };
+
+                if !allowed {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(crate::types::ErrorBody {
+                            error: "ip not allowlisted".into(),
+                        }),
+                    )
+                        .into_response();
+                }
+
+                next.run(req).await
+            }
+        }));
 
     let admin_routes = Router::new()
         .route("/metrics", get(crate::metrics::metrics_handler))

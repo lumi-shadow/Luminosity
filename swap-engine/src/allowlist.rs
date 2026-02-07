@@ -4,7 +4,7 @@ use axum::extract::ConnectInfo;
 use axum::extract::Request;
 use axum::extract::State;
 use axum::middleware::Next;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json as AxumJson;
 use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr};
@@ -97,7 +97,7 @@ pub async fn require_allowlisted_ip(
     State(st): State<AppState>,
     req: Request,
     next: Next,
-) -> impl IntoResponse {
+) -> Response {
     // Optional strict mode (fully private service). When enabled, fail closed:
     // - Missing connect-info => 403
     //
@@ -132,19 +132,38 @@ pub async fn require_allowlisted_ip(
         }
     };
     let allowed = st.allowlist.read().map(|nets| {
-        // If no allowlist is configured, do not block requests.
-        // (Allowlist enforcement is opt-in via SWAP_ENGINE_ALLOWLIST / SWAP_ENGINE_ALLOWLIST_PATH.)
-        nets.is_empty() || nets.iter().any(|n| n.contains(&ip))
+        // Default mode: if allowlist is empty, do not block requests.
+        //
+        // Strict mode (SWAP_ENGINE_ALLOWLIST_ONLY=true): fail closed if allowlist is empty.
+        // This enables a safe bootstrap flow where the trusted proxy can self-register via:
+        //   POST /admin/allowlist/self   (admin token required; not behind this middleware)
+        if allowlist_only {
+            !nets.is_empty() && nets.iter().any(|n| n.contains(&ip))
+        } else {
+            nets.is_empty() || nets.iter().any(|n| n.contains(&ip))
+        }
     });
     let allowed = match allowed {
         Ok(v) => v,
-        Err(_) => true, // fail-open to avoid bricking the service on poisoned lock
+        Err(_) => {
+            if allowlist_only {
+                // In strict mode, fail closed and force operator intervention.
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(ErrorBody {
+                        error: "allowlist lock poisoned (allowlist-only)".into(),
+                    }),
+                )
+                    .into_response();
+            }
+            true // fail-open in non-strict mode to avoid bricking the service
+        }
     };
     if !allowed {
         return (
             axum::http::StatusCode::FORBIDDEN,
             AxumJson(ErrorBody {
-                error: format!("ip not allowlisted: {ip}"),
+                error: "ip not allowlisted".into(),
             }),
         )
             .into_response();

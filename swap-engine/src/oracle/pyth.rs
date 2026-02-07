@@ -69,6 +69,25 @@ fn upsert_cached_prices(prices: HashMap<String, OraclePrice>) {
     }
 }
 
+fn validate_oracle_price(p: &OraclePrice) -> Result<(), AppError> {
+    // Basic sanity checks to fail closed on malformed oracle data.
+    if p.price <= 0 {
+        return Err(AppError::BadGateway("oracle price must be > 0".into()));
+    }
+    // Pyth expo is typically a small negative integer (e.g. -8). Keep a generous bound.
+    if p.expo < -30 || p.expo > 30 {
+        return Err(AppError::BadGateway(format!(
+            "oracle expo out of range: {} (expected [-30, 30])",
+            p.expo
+        )));
+    }
+    // publish_time is unix seconds.
+    if p.publish_time <= 0 {
+        return Err(AppError::BadGateway("oracle publish_time invalid".into()));
+    }
+    Ok(())
+}
+
 pub async fn load_hermes_prices(
     http: &reqwest::Client,
     hermes_url: &str,
@@ -128,15 +147,14 @@ pub async fn load_hermes_prices(
             .conf
             .parse()
             .map_err(|_| AppError::BadGateway("hermes conf parse failed".into()))?;
-        out.insert(
-            f.id,
-            OraclePrice {
-                price,
-                conf,
-                expo: f.price.expo,
-                publish_time: f.price.publish_time,
-            },
-        );
+        let p = OraclePrice {
+            price,
+            conf,
+            expo: f.price.expo,
+            publish_time: f.price.publish_time,
+        };
+        validate_oracle_price(&p)?;
+        out.insert(f.id, p);
     }
     Ok(out)
 }
@@ -182,12 +200,14 @@ pub async fn load_hermes_price(
         .parse()
         .map_err(|_| AppError::BadGateway("hermes conf parse failed".into()))?;
 
-    Ok(OraclePrice {
+    let p = OraclePrice {
         price,
         conf,
         expo: f.price.expo,
         publish_time: f.price.publish_time,
-    })
+    };
+    validate_oracle_price(&p)?;
+    Ok(p)
 }
 
 /// Background cache refresher for Hermes prices.
@@ -216,12 +236,22 @@ pub async fn hermes_cache_loop(
     }
 }
 
-pub fn enforce_staleness(price: &OraclePrice, max_age_secs: u64) -> Result<(), AppError> {
+pub fn enforce_staleness(
+    price: &OraclePrice,
+    max_age_secs: u64,
+    max_future_secs: u64,
+) -> Result<(), AppError> {
+    validate_oracle_price(price)?;
     // Pyth publish time is in unix seconds.
-    let age = now_unix().saturating_sub(price.publish_time);
-    if age < 0 {
-        return Ok(());
+    let now = now_unix();
+    if price.publish_time > now.saturating_add(max_future_secs as i64) {
+        return Err(AppError::Forbidden(format!(
+            "oracle publish_time too far in the future: publish_time={} now={} max_future_secs={}",
+            price.publish_time, now, max_future_secs
+        )));
     }
+    // If slightly in the future (clock skew), treat age as 0.
+    let age = now.saturating_sub(price.publish_time).max(0);
     if age as u64 > max_age_secs {
         return Err(AppError::Forbidden(format!(
             "oracle price too old: age_secs={} max_age_secs={}",
@@ -238,6 +268,9 @@ pub fn conf_band(price: &OraclePrice, conf_mult_bps: u64) -> (i128, i128) {
     let p = price.price as i128;
     let c = price.conf as i128;
     let mult = conf_mult_bps as i128; // bps of 1x = 10_000
-    let extra = (c * mult) / 10_000i128;
-    (p - extra, p + extra)
+    // Use saturating math to avoid overflow with misconfiguration/extreme values.
+    let extra = c
+        .saturating_mul(mult)
+        .saturating_div(10_000i128);
+    (p.saturating_sub(extra), p.saturating_add(extra))
 }

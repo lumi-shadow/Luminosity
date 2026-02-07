@@ -106,13 +106,13 @@ pub async fn quote(
     metrics::metrics().quote_requests_total.inc();
     if let Err(e) = req.validate() {
         metrics::metrics().bad_payload_total.inc();
-        if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()) {
+        if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()).await {
             metrics::metrics().rate_limited_total.inc();
             return api_err(rl);
         }
         return api_err(e);
     }
-    if let Err(rl) = rate_limit::rate_limit_ok(&st, peer.ip()) {
+    if let Err(rl) = rate_limit::rate_limit_ok(&st, peer.ip()).await {
         metrics::metrics().rate_limited_total.inc();
         return api_err(rl);
     }
@@ -126,7 +126,7 @@ pub async fn quote(
             metrics::metrics().quote_errors_total.inc();
             if matches!(e, AppError::BadRequest(_)) {
                 metrics::metrics().bad_requests_total.inc();
-                if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()) {
+                if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()).await {
                     metrics::metrics().rate_limited_total.inc();
                     return api_err(rl);
                 }
@@ -154,13 +154,13 @@ pub async fn execute(
     metrics::metrics().execute_requests_total.inc();
     if let Err(e) = req.validate() {
         metrics::metrics().bad_payload_total.inc();
-        if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()) {
+        if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()).await {
             metrics::metrics().rate_limited_total.inc();
             return api_err(rl);
         }
         return api_err(e);
     }
-    if let Err(rl) = rate_limit::rate_limit_ok(&st, peer.ip()) {
+    if let Err(rl) = rate_limit::rate_limit_ok(&st, peer.ip()).await {
         metrics::metrics().rate_limited_total.inc();
         return api_err(rl);
     }
@@ -198,7 +198,7 @@ pub async fn execute(
             metrics::metrics().execute_errors_total.inc();
             if matches!(e, AppError::BadRequest(_)) {
                 metrics::metrics().bad_requests_total.inc();
-                if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()) {
+                if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()).await {
                     metrics::metrics().rate_limited_total.inc();
                     return api_err(rl);
                 }
@@ -217,7 +217,7 @@ pub async fn execute_job(
 ) -> ApiResult<serde_json::Value> {
     if let Err(e) = req.validate() {
         metrics::metrics().bad_payload_total.inc();
-        if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()) {
+        if let Err(rl) = rate_limit::rate_limit_bad(&st, peer.ip()).await {
             metrics::metrics().rate_limited_total.inc();
             return api_err(rl);
         }
@@ -235,7 +235,7 @@ pub async fn execute_job(
             jobs_len, max_jobs
         )));
     }
-    if let Err(rl) = rate_limit::rate_limit_ok(&st, peer.ip()) {
+    if let Err(rl) = rate_limit::rate_limit_ok(&st, peer.ip()).await {
         metrics::metrics().rate_limited_total.inc();
         return api_err(rl);
     }
@@ -396,7 +396,7 @@ pub async fn execute_job(
                     metrics::metrics().execute_errors_total.inc();
                     if matches!(e, AppError::BadRequest(_)) {
                         metrics::metrics().bad_requests_total.inc();
-                        if let Err(rl) = rate_limit::rate_limit_bad(&st_bg, peer_ip) {
+                        if let Err(rl) = rate_limit::rate_limit_bad(&st_bg, peer_ip).await {
                             metrics::metrics().rate_limited_total.inc();
                             j.status = "failed".into();
                             j.error = Some(rl.to_string());

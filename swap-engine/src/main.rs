@@ -58,8 +58,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.api_bind, cfg.program_id, cfg.indexer_url
     );
     info!(
-        "quote policy: base_spread_bps={} max_spread_bps={} skew_k_bps={} max_skew_bps={}",
+        "quote policy: base_spread_bps={} max_spread_bps={} skew_k_bps={} max_skew_bps={} skew_small_div_bps={}",
         cfg.base_spread_bps, cfg.max_spread_bps, cfg.skew_k_bps, cfg.max_skew_bps
+        , cfg.skew_small_div_bps
     );
 
     let http = reqwest::Client::new();
@@ -110,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         execute_semaphore: Arc::new(Semaphore::new(max_exec.max(1))),
         jobs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         job_seq: Arc::new(AtomicU64::new(1)),
-        rate_limiter: Arc::new(std::sync::Mutex::new(rate_limit::RateLimiter::from_env())),
+        rate_limiter: Arc::new(tokio::sync::Mutex::new(rate_limit::RateLimiter::from_env())),
         allowlist: Arc::new(std::sync::RwLock::new(allowlist)),
         allowlist_path,
     };

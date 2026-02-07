@@ -19,7 +19,8 @@ use crate::oracle::pyth::{
 };
 use crate::solana::{
     canonical_mints, execute_rfq_swap_append_tx, fetch_amm_tree_and_tee, fetch_asset_id_for_mint,
-    fetch_mint_decimals, fetch_pool, fetch_pool_cached, fetch_token_account_amounts, pool_pda,
+    fetch_mint_decimals, fetch_pool, fetch_pool_cached, fetch_token_account_amounts,
+    invalidate_pool_cache, pool_pda,
 };
 use crate::types::{
     AppError, ExecuteRequest, ExecuteResponse, OracleDetails, QuoteRequest, QuoteResponse,
@@ -219,6 +220,39 @@ fn rel_error_bps(pool_num: u128, pool_den: u128, oracle_num: u128, oracle_den: u
     saturating_div_bps(diff, b)
 }
 
+fn post_trade_reserves_canonical(
+    pool: &crate::types::PoolAccount,
+    mint_in: Pubkey,
+    amount_in: u64,
+    amount_out: u64,
+) -> Result<(u64, u64), AppError> {
+    // Compute post-trade virtual reserves (canonical order in the Pool account).
+    // This is the TEE's responsibility; clients must not be trusted to provide reserves.
+    let (mut new_reserve_a, mut new_reserve_b) = (pool.reserve_a, pool.reserve_b);
+    if mint_in == pool.mint_a {
+        // a -> b: reserve_a increases, reserve_b decreases
+        new_reserve_a = new_reserve_a
+            .checked_add(amount_in)
+            .ok_or_else(|| AppError::BadGateway("reserve overflow (new_reserve_a)".into()))?;
+        new_reserve_b = new_reserve_b
+            .checked_sub(amount_out)
+            .ok_or_else(|| AppError::Forbidden("amount_out exceeds pool reserves".into()))?;
+    } else if mint_in == pool.mint_b {
+        // b -> a: reserve_b increases, reserve_a decreases
+        new_reserve_b = new_reserve_b
+            .checked_add(amount_in)
+            .ok_or_else(|| AppError::BadGateway("reserve overflow (new_reserve_b)".into()))?;
+        new_reserve_a = new_reserve_a
+            .checked_sub(amount_out)
+            .ok_or_else(|| AppError::Forbidden("amount_out exceeds pool reserves".into()))?;
+    } else {
+        return Err(AppError::BadRequest(
+            "mint_in must match pool mint_a or mint_b".into(),
+        ));
+    }
+    Ok((new_reserve_a, new_reserve_b))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct OracleMidState {
     num: u128,
@@ -356,8 +390,16 @@ fn compute_quote_from_state(
     p_out: &OraclePrice,
     amount_in: u64,
 ) -> Result<QuoteResponse, AppError> {
-    enforce_staleness(p_in, cfg.oracle_max_staleness_secs)?;
-    enforce_staleness(p_out, cfg.oracle_max_staleness_secs)?;
+    enforce_staleness(
+        p_in,
+        cfg.oracle_max_staleness_secs,
+        cfg.oracle_max_future_secs,
+    )?;
+    enforce_staleness(
+        p_out,
+        cfg.oracle_max_staleness_secs,
+        cfg.oracle_max_future_secs,
+    )?;
 
     // Oracle shock circuit breaker (flash-crash / bad tick protection).
     // This is intentionally conservative: if the oracle mid jumps too far too fast, we pause.
@@ -433,27 +475,37 @@ fn compute_quote_from_state(
         (num / total) as i64
     };
 
-    // Nonlinear inventory skew: use x^4 curve so it barely affects small imbalances,
-    // and ramps up hard only when the pool is far off balance.
+    // Nonlinear inventory skew:
+    // - keep the existing x^4 behavior for large imbalances (ramps up hard only when far off balance)
+    // - add a gentle "small imbalance" term so skew is meaningfully non-zero around ~50–300 bps
     //
     // Let x = |imbalance| / 10_000 (normalized to [0,1]).
     // Original (linear): imbalance_bps = sign * (x * 10_000)
     // New: imbalance_pow4_bps = sign * (x^4 * 10_000) = sign * (|imbalance_bps|^4 / 10_000^3)
     let denom_1e12: i128 = 1_000_000_000_000; // 10_000^3
     let abs_bps: i128 = (imbalance_bps as i128).unsigned_abs() as i128;
-    let pow4_bps: i128 = if abs_bps == 0 {
+    let pow4_mag_bps: i128 = if abs_bps == 0 {
         0
     } else {
         let abs4 = abs_bps
             .saturating_mul(abs_bps)
             .saturating_mul(abs_bps)
             .saturating_mul(abs_bps);
-        let scaled = abs4.saturating_div(denom_1e12);
-        let sign = imbalance_bps.signum() as i128;
-        sign.saturating_mul(scaled)
+        abs4.saturating_div(denom_1e12)
     };
+    let small_mag_bps: i128 = if abs_bps == 0 {
+        0
+    } else {
+        // Gentle linear response for small imbalances:
+        // 1 "signal bps" per `skew_small_div_bps` imbalance bps.
+        abs_bps.saturating_div((cfg.skew_small_div_bps as i128).max(1))
+    };
+    let skew_signal_mag_bps: i128 = core::cmp::max(pow4_mag_bps, small_mag_bps);
+    let sign = imbalance_bps.signum() as i128;
+    let pow4_bps: i128 = sign.saturating_mul(pow4_mag_bps);
+    let skew_signal_bps: i128 = sign.saturating_mul(skew_signal_mag_bps);
 
-    let mut skew_bps: i64 = (pow4_bps as i128)
+    let mut skew_bps: i64 = (skew_signal_bps as i128)
         .saturating_mul(cfg.skew_k_bps as i128)
         .saturating_div(10_000i128) as i64;
     skew_bps = clamp_i64(skew_bps, -cfg.max_skew_bps, cfg.max_skew_bps);
@@ -461,6 +513,8 @@ fn compute_quote_from_state(
     debug!(
         imbalance_bps,
         pow4_bps = (pow4_bps as i64),
+        small_bps = (sign.saturating_mul(small_mag_bps) as i64),
+        skew_signal_bps = (skew_signal_bps as i64),
         skew_bps,
         skew_k_bps = cfg.skew_k_bps,
         max_skew_bps = cfg.max_skew_bps,
@@ -501,21 +555,25 @@ fn compute_quote_from_state(
 
     let bps_delta: i64 =
         bps_delta_from_spread_and_centerline_shift(spread_bps, skew_bps, direction_sign);
-    let mut amount_out = quote_amount_out_pmm_oracle_mid(
+    let mut amount_out_base = quote_amount_out_pmm_oracle_mid(
         amount_in, dec_in, dec_out, oracle_num, oracle_den, bps_delta,
     );
 
-    // Hard price-impact guard: cap oracle-mid quote by CPMM output.
-    // This prevents pathological "near linear" pricing when a user tries to take a huge fraction of the pool.
+    // CPMM cap: only apply for sufficiently large trades.
+    // This keeps small trades oracle-anchored even if the pool spot drifts, but preserves
+    // strong non-linear price impact for large trades (prevents draining at oracle mid).
     let cpmm_out = quote_amount_out_cpmm(amount_in, reserve_in, reserve_out);
-    amount_out = core::cmp::min(amount_out, cpmm_out);
+    let apply_cpmm_cap = cfg.cpmm_cap_min_size_bps > 0 && size_bps >= cfg.cpmm_cap_min_size_bps;
+    if apply_cpmm_cap {
+        amount_out_base = core::cmp::min(amount_out_base, cpmm_out);
+    }
 
     // Safety: never exceed pool reserves. Keep strictly less than reserve_out to avoid execute underflow.
     let reserve_cap = reserve_out.saturating_sub(1);
-    amount_out = core::cmp::min(amount_out, reserve_cap);
+    amount_out_base = core::cmp::min(amount_out_base, reserve_cap);
 
     // Compare implied ratio against oracle ratio using confidence bands.
-    let implied_num = (amount_out as i128).saturating_mul(pow10_i128(dec_in));
+    let implied_num = (amount_out_base as i128).saturating_mul(pow10_i128(dec_in));
     let implied_den = (amount_in as i128).saturating_mul(pow10_i128(dec_out));
 
     let (_in_lo, in_hi) = conf_band(p_in, cfg.oracle_conf_mult_bps);
@@ -545,7 +603,7 @@ fn compute_quote_from_state(
                     let max_out = (num / den) as u64;
                     let reserve_cap = reserve_out.saturating_sub(1);
                     let max_out = core::cmp::min(max_out, reserve_cap);
-                    amount_out = core::cmp::min(amount_out, max_out);
+                    amount_out_base = core::cmp::min(amount_out_base, max_out);
                 } else {
                     price_ok = false;
                 }
@@ -555,11 +613,66 @@ fn compute_quote_from_state(
         }
     }
 
+    // Optional rebalancing incentive:
+    // allow a small positive bonus (quote slightly better than oracle mid) ONLY if the trade is predicted
+    // to reduce oracle deviation (post_err_bps < pre_err_bps) and deviation is meaningfully large.
+    //
+    // This helps prevent one side drifting farther from oracle as the oracle moves (no keeper required).
+    let mut amount_out = amount_out_base;
+    let mut rebalance_bonus_applied_bps: u64 = 0;
+    let mut applied_delta_bps: i64 = bps_delta;
+    if cfg.rebalance_bonus_bps > 0
+        && cfg.rebalance_max_bonus_bps > 0
+        && reserve_in > 0
+        && reserve_out > 0
+        && amount_out > 0
+    {
+        let (pre_num, pre_den) = pool_spot_ratio_out_per_in(reserve_in, reserve_out, dec_in, dec_out);
+        let pre_err = rel_error_bps(pre_num, pre_den, oracle_num, oracle_den);
+        if pre_err >= cfg.rebalance_min_deviation_bps {
+            // Candidate delta (may be slightly >0).
+            let bonus = core::cmp::min(cfg.rebalance_bonus_bps, cfg.rebalance_max_bonus_bps) as i64;
+            let mut candidate_delta = bps_delta.saturating_add(bonus);
+            candidate_delta = clamp_i64(candidate_delta, -9_999, cfg.rebalance_max_bonus_bps as i64);
+
+            // Recompute out with candidate delta.
+            let mut candidate_out = quote_amount_out_pmm_oracle_mid(
+                amount_in, dec_in, dec_out, oracle_num, oracle_den, candidate_delta,
+            );
+            if apply_cpmm_cap {
+                candidate_out = core::cmp::min(candidate_out, cpmm_out);
+            }
+            candidate_out = core::cmp::min(candidate_out, reserve_cap);
+
+            // Execute-time already enforces a deviation-improving check when price_ok=false.
+            // Here we require improvement even for quoting the bonus.
+            if candidate_out > 0 && candidate_out < reserve_out {
+                let post_in = reserve_in.saturating_add(amount_in);
+                let post_out = reserve_out.saturating_sub(candidate_out);
+                if post_out > 0 {
+                    let (post_num, post_den) = pool_spot_ratio_out_per_in(post_in, post_out, dec_in, dec_out);
+                    let post_err = rel_error_bps(post_num, post_den, oracle_num, oracle_den);
+                    if post_err < pre_err {
+                        amount_out = candidate_out;
+                        let eff = candidate_delta.saturating_sub(bps_delta);
+                        if eff > 0 {
+                            rebalance_bonus_applied_bps = eff as u64;
+                        }
+                        applied_delta_bps = candidate_delta;
+                        // Note: we keep spread_bps/skew_bps fields as-is; this is an additional small bonus.
+                    }
+                }
+            }
+        }
+    }
+
     Ok(QuoteResponse {
         amount_out,
         spread_bps,
         // Expose signed skew for the requested direction for UI/debugging.
         skew_bps: clamp_i64(direction_sign.saturating_mul(skew_bps), -9_999, 9_999),
+        policy_delta_bps: applied_delta_bps,
+        rebalance_bonus_bps: rebalance_bonus_applied_bps,
         price_ok,
         oracle_details: Some(OracleDetails {
             price_in: p_in.price,
@@ -719,6 +832,46 @@ mod tests {
         assert_eq!(cpmm, 473_684);
         assert!(cpmm < oracle_linear);
     }
+
+    #[test]
+    fn cpmm_cap_threshold_logic() {
+        // size_bps = 100 => 1% of reserves. Ensure threshold works as expected.
+        let reserve_in = 1_000_000u64;
+        let amount_small = 10_000u64; // 1%
+        let amount_big = 30_000u64; // 3%
+        let size_small = saturating_div_bps(amount_small as u128, reserve_in as u128);
+        let size_big = saturating_div_bps(amount_big as u128, reserve_in as u128);
+        assert_eq!(size_small, 100);
+        assert_eq!(size_big, 300);
+        let threshold = 200u64; // 2%
+        assert!(size_small < threshold);
+        assert!(size_big >= threshold);
+    }
+
+    #[test]
+    fn post_trade_reserves_canonical_updates_expected_side() {
+        let mint_a = Pubkey::new_unique();
+        let mint_b = Pubkey::new_unique();
+        let pool = crate::types::PoolAccount {
+            amm: Pubkey::new_unique(),
+            mint_a,
+            mint_b,
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            reserve_a: 1_000,
+            reserve_b: 2_000,
+        };
+
+        // a -> b
+        let (ra, rb) = post_trade_reserves_canonical(&pool, mint_a, 111, 222).unwrap();
+        assert_eq!(ra, 1_111);
+        assert_eq!(rb, 1_778);
+
+        // b -> a
+        let (ra2, rb2) = post_trade_reserves_canonical(&pool, mint_b, 333, 444).unwrap();
+        assert_eq!(ra2, 556);
+        assert_eq!(rb2, 2_333);
+    }
 }
 pub async fn execute(
     cfg: &Config,
@@ -829,6 +982,26 @@ pub async fn execute(
             pool_pda(&cfg.program_id, &a, &b).0
         }
     };
+
+    // Optional hardening: if a caller explicitly provides `pool`, require it to match the
+    // canonical PDA derived from (mint_in, mint_out) unless explicitly disabled.
+    //
+    // This prevents a caller from steering the engine to an unexpected pool address when multiple
+    // pools could exist. Default is permissive for backward compatibility.
+    let enforce_canonical_pool = std::env::var("SWAP_ENGINE_ENFORCE_CANONICAL_POOL")
+        .ok()
+        .map(|v| v.trim().to_lowercase() == "true")
+        .unwrap_or(false);
+    if enforce_canonical_pool {
+        let (a, b) = canonical_mints(mint_in, mint_out);
+        let derived = pool_pda(&cfg.program_id, &a, &b).0;
+        if pool_pk != derived {
+            return Err(AppError::Forbidden(format!(
+                "non-canonical pool rejected (set SWAP_ENGINE_ENFORCE_CANONICAL_POOL=false to allow): provided={} derived={}",
+                pool_pk, derived
+            )));
+        }
+    }
 
     // NOTE: Legacy nullifier PDA spend-check removed.
     // Spent protection is enforced on-chain via spent-by-leaf-index bitmap.
@@ -1150,39 +1323,35 @@ pub async fn execute(
     // This prevents the swap-engine from pushing the system into an un-withdrawable state.
     // -------------------------------------------------------------------------
     if pool.reserve_a > vault_a_amt || pool.reserve_b > vault_b_amt {
-        return Err(AppError::BadGateway(format!(
-            "pool insolvent: reserves exceed vault balances (reserve_a={} vault_a={} reserve_b={} vault_b={})",
-            pool.reserve_a, vault_a_amt, pool.reserve_b, vault_b_amt
-        )));
+        tracing::warn!(
+            reserve_a = pool.reserve_a,
+            vault_a = vault_a_amt,
+            reserve_b = pool.reserve_b,
+            vault_b = vault_b_amt,
+            "pool insolvent: reserves exceed vault balances"
+        );
+        return Err(AppError::BadGateway(
+            "pool insolvent: reserves exceed vault balances".into(),
+        ));
     }
 
     // Compute post-trade virtual reserves (canonical order in the Pool account).
     // This is the TEE's responsibility; clients must not be trusted to provide reserves.
-    let (mut new_reserve_a, mut new_reserve_b) = (pool.reserve_a, pool.reserve_b);
-    if mint_in == pool.mint_a {
-        // a -> b: reserve_a increases, reserve_b decreases
-        new_reserve_a = new_reserve_a
-            .checked_add(req.amount_in)
-            .ok_or_else(|| AppError::BadGateway("reserve overflow (new_reserve_a)".into()))?;
-        new_reserve_b = new_reserve_b
-            .checked_sub(amount_out)
-            .ok_or_else(|| AppError::Forbidden("amount_out exceeds pool reserves".into()))?;
-    } else {
-        // b -> a: reserve_b increases, reserve_a decreases
-        new_reserve_b = new_reserve_b
-            .checked_add(req.amount_in)
-            .ok_or_else(|| AppError::BadGateway("reserve overflow (new_reserve_b)".into()))?;
-        new_reserve_a = new_reserve_a
-            .checked_sub(amount_out)
-            .ok_or_else(|| AppError::Forbidden("amount_out exceeds pool reserves".into()))?;
-    }
+    let (new_reserve_a, new_reserve_b) =
+        post_trade_reserves_canonical(&pool, mint_in, effective_amount_in, amount_out)?;
 
     // Final guard: the updated reserves must still be covered by real vault balances.
     if new_reserve_a > vault_a_amt || new_reserve_b > vault_b_amt {
-        return Err(AppError::Forbidden(format!(
-            "solvency guard: swap would exceed vault balances (new_reserve_a={} vault_a={} new_reserve_b={} vault_b={})",
-            new_reserve_a, vault_a_amt, new_reserve_b, vault_b_amt
-        )));
+        tracing::warn!(
+            new_reserve_a,
+            vault_a = vault_a_amt,
+            new_reserve_b,
+            vault_b = vault_b_amt,
+            "solvency guard: swap would exceed vault balances"
+        );
+        return Err(AppError::Forbidden(
+            "solvency guard: swap would exceed vault balances".into(),
+        ));
     }
 
     let swap = RfqSwapUpdate {
@@ -1201,14 +1370,16 @@ pub async fn execute(
         tee_authority,
         pool_pk,
         merkle_tree,
+        pool.reserve_a,
+        pool.reserve_b,
         swap,
         &encrypted_note,
         &siblings_for_tx,
     )?;
 
-    // NOTE: we intentionally do NOT update the in-process pool cache here anymore.
-    // Since we no longer synchronously confirm the transaction on this code path, updating the cache
-    // optimistically would make `/quote` inconsistent if the tx fails or expires.
+    // We do not optimistically update cached reserves (tx may fail), but we *do* invalidate the entry
+    // so the next `/quote` re-reads the pool from chain instead of reusing potentially stale reserves.
+    invalidate_pool_cache(&pool_pk);
 
     Ok(ExecuteResponse {
         signature: sig.to_string(),

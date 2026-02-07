@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::str::FromStr;
+use url::Url;
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -48,6 +49,10 @@ pub struct Config {
     pub hermes_feed_ids: HashMap<Pubkey, String>,
     /// Reject oracle prices older than this many seconds.
     pub oracle_max_staleness_secs: u64,
+    /// Reject oracle prices whose publish_time is too far in the future.
+    ///
+    /// This prevents a future-timestamped value from bypassing staleness checks.
+    pub oracle_max_future_secs: u64,
     /// Expand confidence interval by this multiplier in basis points. 10_000 = 1.0x.
     pub oracle_conf_mult_bps: u64,
 
@@ -82,6 +87,32 @@ pub struct Config {
     pub skew_k_bps: i64,
     /// Clamp for skew_bps (absolute value).
     pub max_skew_bps: i64,
+    /// Small-imbalance skew sensitivity (gentle).
+    ///
+    /// We compute an additional "small imbalance" signal:
+    ///   small_skew_signal_bps = |imbalance_bps| / skew_small_div_bps
+    ///
+    /// The engine then uses:
+    ///   skew_signal_bps = max(pow4_signal_bps, small_skew_signal_bps) * sign(imbalance)
+    ///
+    /// This makes skew meaningfully non-zero around ~50–300 bps imbalance without making it extreme.
+    pub skew_small_div_bps: i64,
+
+    // --- CPMM cap (large-trade protection) ---
+    /// Only apply the CPMM output cap when the trade is at least this fraction of the input reserve.
+    ///
+    /// Units: basis points of `reserve_in` (so 100 = 1.00% of the input reserve).
+    /// This prevents the CPMM cap from dominating small trades when the pool spot drifts from oracle.
+    pub cpmm_cap_min_size_bps: u64,
+
+    // --- Rebalancing incentive (optional) ---
+    /// Allow a small positive bps bonus (quote slightly better than oracle mid) ONLY when the trade
+    /// is predicted to reduce oracle deviation (post_err_bps < pre_err_bps).
+    pub rebalance_bonus_bps: u64,
+    /// Only consider applying rebalancing bonus when the pool's pre-trade oracle deviation is at least this many bps.
+    pub rebalance_min_deviation_bps: u64,
+    /// Hard cap on the positive bonus (bps).
+    pub rebalance_max_bonus_bps: u64,
 }
 
 fn env_required(key: &str) -> anyhow::Result<String> {
@@ -95,22 +126,92 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "y" | "on")
+        })
+        .unwrap_or(default)
+}
+
+fn validate_hermes_url(raw: &str) -> anyhow::Result<String> {
+    let u = Url::parse(raw).with_context(|| format!("Invalid HERMES_URL: {raw}"))?;
+    let scheme = u.scheme();
+    let allow_insecure_http = env_bool("HERMES_ALLOW_INSECURE_HTTP", false);
+    if scheme != "https" && !(allow_insecure_http && scheme == "http") {
+        anyhow::bail!(
+            "HERMES_URL must use https (or set HERMES_ALLOW_INSECURE_HTTP=true): {raw}"
+        );
+    }
+    let host = u
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("HERMES_URL missing host: {raw}"))?;
+
+    // SSRF guard: by default, disallow localhost and private IP targets.
+    // Operators can override for local Hermes nodes by setting HERMES_ALLOW_PRIVATE=true.
+    let allow_private = env_bool("HERMES_ALLOW_PRIVATE", false);
+    if !allow_private {
+        if host.eq_ignore_ascii_case("localhost")
+            || host.ends_with(".localhost")
+            || host.eq_ignore_ascii_case("127.0.0.1")
+            || host.eq_ignore_ascii_case("::1")
+        {
+            anyhow::bail!("HERMES_URL must not target localhost (set HERMES_ALLOW_PRIVATE=true to override): {raw}");
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let is_private = match ip {
+                std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+                std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+            };
+            if is_private {
+                anyhow::bail!("HERMES_URL must not target a private IP (set HERMES_ALLOW_PRIVATE=true to override): {raw}");
+            }
+        }
+    }
+
+    Ok(raw.trim().trim_end_matches('/').to_string())
+}
+
 pub fn load_config() -> anyhow::Result<Config> {
     let admin_token = env::var("ADMIN_TOKEN")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| env::var("SWAP_ENGINE_ADMIN_TOKEN").ok().filter(|s| !s.trim().is_empty()))
         .ok_or_else(|| anyhow::anyhow!("Missing env var: ADMIN_TOKEN (or SWAP_ENGINE_ADMIN_TOKEN)"))?;
+    if admin_token.trim().len() < 32 {
+        anyhow::bail!("ADMIN_TOKEN must be at least 32 characters");
+    }
 
     let rpc_url = env_required("RPC_URL")?;
     let indexer_url = env_required("INDEXER_URL")?;
     let program_id =
         Pubkey::from_str(&env_required("PROGRAM_ID")?).context("Invalid PROGRAM_ID")?;
 
-    let tee_keypair: Option<PathBuf> = env::var("TEE_KEYPAIR").ok().map(PathBuf::from);
-    let api_bind = env::var("API_BIND").unwrap_or_else(|_| "0.0.0.0:9797".to_string());
+    let tee_keypair: Option<PathBuf> = env::var("TEE_KEYPAIR")
+        .ok()
+        .map(PathBuf::from)
+        .map(|p| {
+            // Basic path traversal guard for env-provided paths.
+            // (Still relies on file permissions for actual access control.)
+            if !p.is_absolute() {
+                return Err(anyhow::anyhow!("TEE_KEYPAIR must be an absolute path"));
+            }
+            if p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(anyhow::anyhow!("TEE_KEYPAIR must not contain '..'"));
+            }
+            Ok(p)
+        })
+        .transpose()?;
+
+    // Secure-by-default bind: only listen on loopback unless explicitly configured.
+    let api_bind = env::var("API_BIND").unwrap_or_else(|_| "127.0.0.1:9797".to_string());
 
     let oracle_max_staleness_secs = env_u64("ORACLE_MAX_STALENESS_SECS", 60);
+    let oracle_max_future_secs = env_u64("ORACLE_MAX_FUTURE_SECS", 5);
     let oracle_conf_mult_bps = env_u64("ORACLE_CONF_MULT_BPS", 20_000);
 
     // Oracle shock circuit breaker defaults:
@@ -143,6 +244,23 @@ pub fn load_config() -> anyhow::Result<Config> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50);
+    // Gentle small-imbalance skew: 1 bps of skew signal per N bps imbalance.
+    // Example: 250 => at ~250 bps imbalance you start seeing ~1 bps (before `skew_k_bps` scaling).
+    let mut skew_small_div_bps: i64 = env::var("SKEW_SMALL_DIV_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(250);
+
+    // CPMM cap defaults:
+    // - only kick in when trade is >= 2% of reserve_in
+    let cpmm_cap_min_size_bps = env_u64("CPMM_CAP_MIN_SIZE_BPS", 200);
+
+    // Rebalancing incentive defaults:
+    // - disabled by default unless explicitly enabled
+    // - when enabled, keep it small (20-50 bps) and only when pool is meaningfully off oracle
+    let rebalance_bonus_bps = env_u64("REBALANCE_BONUS_BPS", 0);
+    let rebalance_min_deviation_bps = env_u64("REBALANCE_MIN_DEVIATION_BPS", 200);
+    let rebalance_max_bonus_bps = env_u64("REBALANCE_MAX_BONUS_BPS", 50);
 
     // --- Safety clamps ---
     //
@@ -184,9 +302,25 @@ pub fn load_config() -> anyhow::Result<Config> {
         );
         max_skew_bps = max_skew_bps.signum() * MAX_SKEW_BPS_HARD_CAP;
     }
+    // Skew divisor must be positive and not absurdly small.
+    if skew_small_div_bps <= 0 {
+        tracing::warn!("SKEW_SMALL_DIV_BPS={} invalid; defaulting to 250", skew_small_div_bps);
+        skew_small_div_bps = 250;
+    }
+    // Hard floor: if too small, skew responds too aggressively in the 50–300 bps region.
+    const SKEW_SMALL_DIV_BPS_FLOOR: i64 = 25;
+    if skew_small_div_bps < SKEW_SMALL_DIV_BPS_FLOOR {
+        tracing::warn!(
+            "SKEW_SMALL_DIV_BPS={} too small; clamping to {}",
+            skew_small_div_bps,
+            SKEW_SMALL_DIV_BPS_FLOOR
+        );
+        skew_small_div_bps = SKEW_SMALL_DIV_BPS_FLOOR;
+    }
 
-    let hermes_url =
+    let hermes_url_raw =
         env::var("HERMES_URL").unwrap_or_else(|_| "https://hermes.pyth.network".to_string());
+    let hermes_url = validate_hermes_url(&hermes_url_raw)?;
     let mut hermes_feed_ids: HashMap<Pubkey, String> = HashMap::new();
     // Built-in defaults for your current mainnet pool.
     hermes_feed_ids.insert(
@@ -201,6 +335,14 @@ pub fn load_config() -> anyhow::Result<Config> {
     // Optional override/extension:
     // JSON map { "<mint_pubkey>": "<hermes_feed_id_hex>", ... }
     let hermes_feeds_json = env::var("HERMES_FEEDS_JSON").unwrap_or_else(|_| "{}".to_string());
+    const HERMES_FEEDS_JSON_MAX_LEN: usize = 32 * 1024;
+    if hermes_feeds_json.len() > HERMES_FEEDS_JSON_MAX_LEN {
+        anyhow::bail!(
+            "HERMES_FEEDS_JSON too large ({} bytes, max {})",
+            hermes_feeds_json.len(),
+            HERMES_FEEDS_JSON_MAX_LEN
+        );
+    }
     let raw: HashMap<String, String> = serde_json::from_str(&hermes_feeds_json)
         .context("Invalid HERMES_FEEDS_JSON (expected JSON map mint->hermes_feed_id_hex)")?;
     for (mint_s, id_hex) in raw {
@@ -219,6 +361,7 @@ pub fn load_config() -> anyhow::Result<Config> {
         hermes_url,
         hermes_feed_ids,
         oracle_max_staleness_secs,
+        oracle_max_future_secs,
         oracle_conf_mult_bps,
         oracle_shock_max_jump_bps,
         oracle_shock_window_secs,
@@ -230,5 +373,10 @@ pub fn load_config() -> anyhow::Result<Config> {
         max_spread_bps,
         skew_k_bps,
         max_skew_bps,
+        skew_small_div_bps,
+        cpmm_cap_min_size_bps,
+        rebalance_bonus_bps,
+        rebalance_min_deviation_bps,
+        rebalance_max_bonus_bps,
     })
 }

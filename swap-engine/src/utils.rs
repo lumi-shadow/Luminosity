@@ -34,14 +34,23 @@ pub fn header_admin_token(headers: &HeaderMap) -> Option<String> {
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.contains('\r') && !s.contains('\n'))
         .filter(|s| !s.is_empty())
 }
 
 pub fn header_bearer_token(headers: &HeaderMap) -> Option<String> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    if v.contains('\r') || v.contains('\n') {
+        return None;
+    }
     let prefix = "Bearer ";
     if v.starts_with(prefix) {
-        Some(v[prefix.len()..].trim().to_string())
+        let t = v[prefix.len()..].trim().to_string();
+        if t.contains('\r') || t.contains('\n') {
+            None
+        } else {
+            Some(t)
+        }
     } else {
         None
     }

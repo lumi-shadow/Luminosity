@@ -213,6 +213,17 @@ pub fn upsert_pool_cache(pool: &Pubkey, p: PoolAccount) {
     }
 }
 
+/// Remove a pool entry from the in-process cache.
+///
+/// This is safe to call after submitting an `execute` transaction:
+/// - if the tx lands, the next `/quote` will fetch the updated on-chain reserves
+/// - if the tx fails/expires, the next `/quote` will fetch the unchanged on-chain reserves
+pub fn invalidate_pool_cache(pool: &Pubkey) {
+    if let Ok(mut g) = pool_cache().write() {
+        g.remove(pool);
+    }
+}
+
 pub fn fetch_pool_cached(rpc: &RpcClient, pool: &Pubkey) -> Result<PoolAccount, AppError> {
     let enabled = std::env::var("POOL_CACHE_ENABLED")
         .ok()
@@ -221,10 +232,21 @@ pub fn fetch_pool_cached(rpc: &RpcClient, pool: &Pubkey) -> Result<PoolAccount, 
     if !enabled {
         return fetch_pool(rpc, pool);
     }
-    let ttl_ms: u128 = std::env::var("POOL_CACHE_TTL_MS")
+    let mut ttl_ms: u128 = std::env::var("POOL_CACHE_TTL_MS")
         .ok()
         .and_then(|v| v.parse::<u128>().ok())
         .unwrap_or(250);
+    // Safety clamp: very large TTLs can make quotes look "stuck" after executes.
+    // Keep it small; this cache is only meant to smooth bursts and avoid repeated RPC hits.
+    const TTL_MS_HARD_CAP: u128 = 2_000;
+    if ttl_ms > TTL_MS_HARD_CAP {
+        tracing::warn!(
+            "POOL_CACHE_TTL_MS={}ms too large; clamping to {}ms",
+            ttl_ms,
+            TTL_MS_HARD_CAP
+        );
+        ttl_ms = TTL_MS_HARD_CAP;
+    }
 
     if ttl_ms > 0 {
         if let Ok(g) = pool_cache().read() {
@@ -379,6 +401,10 @@ pub fn execute_rfq_swap_append_tx(
     tee_authority: &Keypair,
     pool: Pubkey,
     merkle_tree: Pubkey,
+    // Expected pool reserves from the state snapshot used to compute `swap.new_reserve_*`.
+    // This defends against TOCTOU races where another swap updates reserves before we submit.
+    expected_pool_reserve_a: u64,
+    expected_pool_reserve_b: u64,
     swap: RfqSwapUpdate,
     encrypted_note: &[u8],
     siblings: &[[u8; 32]],
@@ -398,8 +424,68 @@ pub fn execute_rfq_swap_append_tx(
     let noop_program = Pubkey::from_str(SPL_NOOP_PROGRAM_ID).expect("static");
     let token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static");
 
+    // Defense-in-depth:
+    // - Ensure the provided merkle_tree matches on-chain AMM config
+    // - Ensure the signing key matches on-chain expected tee_authority
+    {
+        let (onchain_tree, onchain_tee) = fetch_amm_tree_and_tee(rpc, &program_id)?;
+        if onchain_tree != merkle_tree {
+            tracing::warn!(
+                provided = %merkle_tree,
+                onchain = %onchain_tree,
+                "merkle_tree mismatch"
+            );
+            return Err(AppError::Forbidden("merkle_tree mismatch".into()));
+        }
+        if onchain_tee != tee_authority.pubkey() {
+            tracing::warn!(
+                provided = %tee_authority.pubkey(),
+                onchain_expected = %onchain_tee,
+                "TEE key mismatch"
+            );
+            return Err(AppError::Forbidden("TEE key mismatch".into()));
+        }
+    }
+
     // Read pool to discover canonical vaults (needed by Phase 1 on-chain solvency guard).
     let pool_acc = fetch_pool(rpc, &pool)?;
+
+    // TOCTOU guard: ensure pool reserves haven't changed since the snapshot we used
+    // to compute `swap.new_reserve_a/b`.
+    //
+    // If they changed, the safest response is to fail closed and require the caller to re-quote.
+    if pool_acc.reserve_a != expected_pool_reserve_a || pool_acc.reserve_b != expected_pool_reserve_b {
+        tracing::warn!(
+            expected_reserve_a = expected_pool_reserve_a,
+            expected_reserve_b = expected_pool_reserve_b,
+            onchain_reserve_a = pool_acc.reserve_a,
+            onchain_reserve_b = pool_acc.reserve_b,
+            "pool state changed before submit"
+        );
+        return Err(AppError::Forbidden(
+            "pool state changed before submit (retry)".into(),
+        ));
+    }
+
+    // Engine-side solvency guard against stale vault balances (race between fetch and submit).
+    // This is redundant with the on-chain guard but provides earlier/friendlier failure.
+    {
+        let amts = fetch_token_account_amounts(rpc, &[pool_acc.vault_a, pool_acc.vault_b])?;
+        let vault_a_amt = amts.get(0).and_then(|v| *v).unwrap_or(0);
+        let vault_b_amt = amts.get(1).and_then(|v| *v).unwrap_or(0);
+        if swap.new_reserve_a > vault_a_amt || swap.new_reserve_b > vault_b_amt {
+            tracing::warn!(
+                new_reserve_a = swap.new_reserve_a,
+                vault_a = vault_a_amt,
+                new_reserve_b = swap.new_reserve_b,
+                vault_b = vault_b_amt,
+                "solvency guard (pre-submit) failed"
+            );
+            return Err(AppError::Forbidden(
+                "solvency guard (pre-submit) failed".into(),
+            ));
+        }
+    }
 
     // Anchor args layout:
     // disc(8)
@@ -469,9 +555,8 @@ pub fn wait_for_signature_confirmed(
     loop {
         if t0.elapsed() > timeout {
             return Err(AppError::BadGateway(format!(
-                "tx confirmation timeout after {}s (sig={})",
-                timeout.as_secs(),
-                sig
+                "tx confirmation timeout after {}s",
+                timeout.as_secs()
             )));
         }
 
@@ -482,7 +567,8 @@ pub fn wait_for_signature_confirmed(
         let s0 = st.value.get(0).and_then(|v| v.as_ref());
         if let Some(s0) = s0 {
             if let Some(err) = &s0.err {
-                return Err(AppError::BadGateway(format!("tx failed (sig={}): {:?}", sig, err)));
+                tracing::warn!(?err, "tx failed while confirming");
+                return Err(AppError::BadGateway("tx failed".into()));
             }
 
             // Treat "confirmed" or "finalized" as success.

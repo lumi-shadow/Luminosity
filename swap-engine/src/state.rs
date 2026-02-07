@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::Semaphore;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,7 +25,7 @@ pub struct AppState {
     pub execute_semaphore: Arc<Semaphore>,
     pub jobs: Arc<tokio::sync::RwLock<HashMap<String, ExecuteJob>>>,
     pub job_seq: Arc<AtomicU64>,
-    pub rate_limiter: Arc<std::sync::Mutex<rate_limit::RateLimiter>>,
+    pub rate_limiter: Arc<Mutex<rate_limit::RateLimiter>>,
     pub allowlist: Arc<RwLock<Vec<IpNet>>>,
     pub allowlist_path: Option<PathBuf>,
 }

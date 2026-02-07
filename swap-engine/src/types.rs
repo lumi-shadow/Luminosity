@@ -32,6 +32,10 @@ fn ensure_hex32_len(field: &str, s: &str) -> Result<(), AppError> {
             t.len()
         )));
     }
+    // Validate that it is actually hex (and exactly 32 bytes).
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(t, &mut out)
+        .map_err(|_| AppError::BadRequest(format!("{field} must be valid hex")))?;
     Ok(())
 }
 
@@ -138,6 +142,17 @@ pub struct QuoteResponse {
     /// Positive means we improved the price for trades that *increase* the currently scarce asset.
     /// Negative means we worsened the price for trades that *decrease* the scarce asset.
     pub skew_bps: i64,
+    /// Total signed bps delta applied to oracle mid for this quote.
+    ///
+    /// This is the actual delta used for the oracle-mid pricing step:
+    /// - typically negative (spread/LP protection)
+    /// - can be slightly positive when `rebalance_bonus_bps > 0` is applied
+    pub policy_delta_bps: i64,
+    /// Additional *positive* quoting bonus applied (in bps) to incentivize trades that
+    /// move the pool closer to the oracle ("rebalancing incentive").
+    ///
+    /// This is separate from `skew_bps` (inventory skew) and is **0** when not applied.
+    pub rebalance_bonus_bps: u64,
     /// Whether the implied trade price passes oracle band checks.
     pub price_ok: bool,
     /// Raw oracle details (optional; useful for debugging).

@@ -69,7 +69,7 @@ pub fn build(state: AppState) -> Router {
                             return (
                                 StatusCode::FORBIDDEN,
                                 Json(crate::types::ErrorBody {
-                                    error: "connect info missing (allowlist-only)".into(),
+                                    message: "connect info missing (allowlist-only)".into(),
                                 }),
                             )
                                 .into_response();
@@ -91,7 +91,7 @@ pub fn build(state: AppState) -> Router {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 Json(crate::types::ErrorBody {
-                                    error: "allowlist lock poisoned (allowlist-only)".into(),
+                                    message: "allowlist lock poisoned (allowlist-only)".into(),
                                 }),
                             )
                                 .into_response();
@@ -104,7 +104,7 @@ pub fn build(state: AppState) -> Router {
                     return (
                         StatusCode::FORBIDDEN,
                         Json(crate::types::ErrorBody {
-                            error: "ip not allowlisted".into(),
+                        message: "ip not allowlisted".into(),
                         }),
                     )
                         .into_response();
@@ -114,9 +114,27 @@ pub fn build(state: AppState) -> Router {
             }
         }));
 
+    // Jupiter RFQ webhook routes:
+    // - bypass IP allowlist (Jupiter traffic is not from fixed operator IPs)
+    // - protected by shared secret `X-API-KEY`
+    let jupiter_routes = if state.cfg.jupiter_enabled {
+        Router::new()
+            .route("/jupiter/rfq/quote", post(handlers::jupiter::quote))
+            .route("/jupiter/rfq/swap", post(handlers::jupiter::swap))
+            .route("/jupiter/rfq/tokens", get(handlers::jupiter::tokens))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_jupiter_api_key,
+            ))
+    } else {
+        Router::new()
+    };
+
     let admin_routes = Router::new()
         .route("/metrics", get(crate::metrics::metrics_handler))
         .route("/upload-key", post(handlers::admin::upload_key))
+        .route("/admin/jupiter/status", get(handlers::admin::jupiter_status))
+        .route("/admin/volatility", get(handlers::admin::volatility_status))
         .route(
             "/admin/allowlist",
             get(allowlist::get_allowlist).put(allowlist::put_allowlist),
@@ -129,6 +147,7 @@ pub fn build(state: AppState) -> Router {
 
     Router::new()
         .merge(public_routes)
+        .merge(jupiter_routes)
         .merge(admin_routes)
         .with_state(state)
         // Hard cap request body size to mitigate spam / pathological JSON payloads.

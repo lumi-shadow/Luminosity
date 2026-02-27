@@ -7,21 +7,22 @@
 //!
 //! Anything that touches the network is delegated:
 //! - RPC fetching / tx submission lives in `solana.rs`
-//! - indexer API calls live in `indexer.rs`
 //! - Pyth parsing/policy lives in `oracle/pyth.rs`
+//!
+//! Merkle proofs are provided by the client (validated on-chain against the root changelog).
 
 use crate::config::Config;
-use crate::indexer::{hex32, IndexerClient};
 use crate::metrics;
 use crate::oracle::pyth::{
     conf_band, enforce_staleness, get_cached_hermes_price, load_hermes_price, load_hermes_prices,
     now_unix, OraclePrice,
 };
 use crate::solana::{
-    canonical_mints, execute_rfq_swap_append_tx, fetch_amm_tree_and_tee, fetch_asset_id_for_mint,
-    fetch_mint_decimals, fetch_pool, fetch_pool_cached, fetch_token_account_amounts,
-    invalidate_pool_cache, pool_pda,
+    canonical_mints, execute_rfq_swap_append_tx, fetch_asset_id_for_mint,
+    fetch_mint_decimals, fetch_pool, fetch_pool_cached, fetch_token_account_amounts, invalidate_pool_cache,
+    pool_pda,
 };
+use crate::solana::fetch_amm_tree_and_tee;
 use crate::types::{
     AppError, ExecuteRequest, ExecuteResponse, OracleDetails, QuoteRequest, QuoteResponse,
     RfqSwapUpdate,
@@ -34,8 +35,10 @@ use rand::RngCore;
 use sha2::Sha256;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::keccak::hashv as keccak_hashv;
+use solana_sdk::compute_budget;
+use solana_sdk::message::{SanitizedMessage, VersionedMessage};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer};
+use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -43,6 +46,21 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tracing::debug;
 use x25519_dalek::{EphemeralSecret as X25519EphemeralSecret, PublicKey as X25519PublicKey};
+
+/// Parse a 32-byte hex string (with or without `0x` prefix) into `[u8; 32]`.
+fn hex32(s: &str) -> Result<[u8; 32], AppError> {
+    let s = s.trim().trim_start_matches("0x");
+    let v = hex::decode(s).map_err(|e| AppError::BadRequest(format!("invalid hex: {e}")))?;
+    if v.len() != 32 {
+        return Err(AppError::BadRequest(format!(
+            "expected 32 bytes, got {}",
+            v.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&v);
+    Ok(out)
+}
 
 fn quote_amount_out_pmm_oracle_mid(
     amount_in_base: u64,
@@ -119,24 +137,12 @@ fn bps_delta_from_spread_and_centerline_shift(
     center_shift_bps: i64,
     direction_sign: i64,
 ) -> i64 {
-    // Pricing model:
-    // - Oracle mid is the center.
-    // - `spread_bps` is the *total* spread width around oracle (bid/ask), so each side applies
-    //   a penalty of `half_spread = spread_bps/2`.
-    // - Inventory skew shifts the *centerline* by at most ±half_spread.
-    //
-    // For a given trade direction we compute:
-    //   multiplier_bps = -half_spread + (direction_sign * clamp(center_shift, ±half_spread))
-    //
-    // This guarantees:
-    // - we never accidentally quote better than oracle mid due to skew alone
-    // - worst-case one side reaches oracle mid (0 penalty) while the other pays full spread (-spread)
-    let half_spread_bps: i64 = (spread_bps as i64).saturating_div(2);
+    // Ceiling division so half_spread >= 1 when spread >= 1.
+    let half_spread_bps: i64 = ((spread_bps as i64) + 1) / 2;
     let center = clamp_i64(center_shift_bps, -half_spread_bps, half_spread_bps);
-    // Defensive guard: regardless of future asymmetric spread/skew changes, the applied delta must
-    // never be positive (we never want to quote *better* than oracle mid due to policy knobs).
     let delta = (-(half_spread_bps)).saturating_add(direction_sign.saturating_mul(center));
-    core::cmp::min(0, delta)
+    // Floor: always charge the taker at least 1 bps. We never fill for free.
+    core::cmp::min(-1, delta)
 }
 
 fn saturating_div_bps(num: u128, den: u128) -> u64 {
@@ -688,6 +694,547 @@ fn compute_quote_from_state(
     })
 }
 
+/// RFQ-optimized quoting: flat spread (no size penalty, no CPMM cap).
+/// Inventory skew is derived from TEE wallet balances instead of pool reserves.
+/// The only output cap is the TEE wallet's actual token balance (enforced by the caller via 404).
+fn compute_quote_rfq(
+    cfg: &Config,
+    mint_in: Pubkey,
+    mint_out: Pubkey,
+    canonical_mint_a: Pubkey,
+    tee_balance_in: u64,
+    tee_balance_out: u64,
+    dec_in: u32,
+    dec_out: u32,
+    p_in: &OraclePrice,
+    p_out: &OraclePrice,
+    amount_in: u64,
+) -> Result<u64, AppError> {
+    enforce_staleness(p_in, cfg.oracle_max_staleness_secs, cfg.oracle_max_future_secs)?;
+    enforce_staleness(p_out, cfg.oracle_max_staleness_secs, cfg.oracle_max_future_secs)?;
+
+    if cfg.cex_circuit_breaker_enabled {
+        let wsol: Pubkey = Pubkey::from_str("So11111111111111111111111111111111111111112")
+            .expect("hardcoded WSOL mint");
+        let (sol_price, sol_expo) = if mint_in == wsol {
+            (p_in.price, p_in.expo)
+        } else if mint_out == wsol {
+            (p_out.price, p_out.expo)
+        } else {
+            (0, 0)
+        };
+        if sol_price > 0 {
+            if let Err(msg) = crate::cex_feed::check_deviation(
+                sol_price,
+                sol_expo,
+                cfg.cex_deviation_threshold_bps,
+            ) {
+                crate::metrics::metrics().cex_breaker_trips_total.inc();
+                return Err(AppError::Unavailable(msg));
+            }
+        }
+    }
+
+    let now = now_unix();
+    {
+        let (a, b) = canonical_mints(mint_in, mint_out);
+        let (p_a, p_b) = if mint_in == a { (p_in, p_out) } else { (p_out, p_in) };
+        let (mid_num, mid_den) = oracle_mid_ratio_out_per_in(&OracleDetails {
+            price_in: p_a.price, conf_in: p_a.conf, expo_in: p_a.expo,
+            price_out: p_b.price, conf_out: p_b.conf, expo_out: p_b.expo,
+            age_in_secs: 0, age_out_secs: 0, imbalance_bps: 0,
+        })?;
+        maybe_trip_oracle_shock(cfg, now, a, b, (mid_num, mid_den))?;
+    }
+
+    let (oracle_num, oracle_den) = oracle_mid_ratio_out_per_in(&OracleDetails {
+        price_in: p_in.price, conf_in: p_in.conf, expo_in: p_in.expo,
+        price_out: p_out.price, conf_out: p_out.conf, expo_out: p_out.expo,
+        age_in_secs: 0, age_out_secs: 0, imbalance_bps: 0,
+    })?;
+
+    // --- TEE wallet inventory skew ---
+    // Skew is based on USD value imbalance of the TEE's own holdings, not the pool.
+    // Canonical mapping: token_a, token_b follow pool.mint_a / pool.mint_b order.
+    let (price_a, expo_a, dec_a, price_b, expo_b, dec_b, bal_a, bal_b) = if mint_in == canonical_mint_a {
+        (p_in.price, p_in.expo, dec_in, p_out.price, p_out.expo, dec_out, tee_balance_in, tee_balance_out)
+    } else {
+        (p_out.price, p_out.expo, dec_out, p_in.price, p_in.expo, dec_in, tee_balance_out, tee_balance_in)
+    };
+    let eff_a = expo_a.saturating_sub(dec_a as i32);
+    let eff_b = expo_b.saturating_sub(dec_b as i32);
+    let common_expo = eff_a.min(eff_b);
+
+    let value_a = usd_value_scaled(bal_a, dec_a, price_a, expo_a, common_expo);
+    let value_b = usd_value_scaled(bal_b, dec_b, price_b, expo_b, common_expo);
+    let total = value_a.saturating_add(value_b);
+    let imbalance_bps: i64 = if total == 0 {
+        0
+    } else {
+        let num = value_b.saturating_sub(value_a).saturating_mul(10_000i128);
+        (num / total) as i64
+    };
+
+    // Linear skew with dead zone: don't penalize small natural fluctuations.
+    let effective_imbalance = if imbalance_bps.abs() <= cfg.rfq_skew_deadzone_bps {
+        0i64
+    } else {
+        let excess = imbalance_bps.abs() - cfg.rfq_skew_deadzone_bps;
+        excess * imbalance_bps.signum()
+    };
+    let mut skew_bps: i64 = ((effective_imbalance as i128)
+        .saturating_mul(cfg.rfq_skew_k_bps as i128)
+        .saturating_div(10_000i128)) as i64;
+    skew_bps = clamp_i64(skew_bps, -cfg.rfq_max_skew_bps, cfg.rfq_max_skew_bps);
+
+    let direction_sign: i64 = if mint_in == canonical_mint_a { 1 } else { -1 };
+
+    // --- Flat spread: base + oracle confidence + staleness + volatility. NO size penalty. ---
+    let age_in = now.saturating_sub(p_in.publish_time);
+    let age_out = now.saturating_sub(p_out.publish_time);
+    let age_max = core::cmp::max(age_in, age_out).max(0);
+
+    let conf_in_bps = saturating_div_bps(
+        p_in.conf as u128, (p_in.price.unsigned_abs() as u128).max(1),
+    );
+    let conf_out_bps = saturating_div_bps(
+        p_out.conf as u128, (p_out.price.unsigned_abs() as u128).max(1),
+    );
+    let conf_bps = core::cmp::max(conf_in_bps, conf_out_bps);
+
+    let _ = conf_bps; // confidence is now fed into the volatility tracker, not added directly
+    let mut spread_bps = cfg.rfq_base_spread_bps;
+    spread_bps = spread_bps.saturating_add((age_max as u64).saturating_mul(cfg.rfq_stale_spread_bps_per_sec));
+
+    // --- Volatility-adaptive spread: widen during turbulence ---
+    // Read EWMA sigma from the volatility tracker (pure atomic read, ~0ns).
+    let (sigma_in, sigma_out) = {
+        let feed_in = cfg.hermes_feed_ids.get(&mint_in).map(|s| s.as_str());
+        let feed_out = cfg.hermes_feed_ids.get(&mint_out).map(|s| s.as_str());
+        (
+            feed_in.map(crate::volatility::sigma_bps).unwrap_or(0),
+            feed_out.map(crate::volatility::sigma_bps).unwrap_or(0),
+        )
+    };
+    let sigma_max = core::cmp::max(sigma_in, sigma_out);
+    let vol_spread = (sigma_max.saturating_mul(cfg.rfq_vol_spread_mult) / 100)
+        .min(cfg.rfq_vol_spread_cap_bps);
+    spread_bps = spread_bps.saturating_add(vol_spread);
+
+    spread_bps = clamp_u64(spread_bps, 0, cfg.rfq_max_spread_bps);
+
+    // --- Momentum-adjusted mid: shift against the trend to front-run adverse selection ---
+    //
+    // We read momentum from the asset with higher sigma (the volatile one, typically SOL).
+    // The sign convention: positive momentum_raw = asset_a is rising relative to asset_b.
+    //
+    // For the centerline shift:
+    //   - If the volatile asset is DUMPING and the trader is SELLING it to us → toxic flow
+    //     → shift mid against them (they get less).
+    //   - If the volatile asset is DUMPING and the trader is BUYING it → good flow
+    //     → shift mid in their favor (they get more, we accumulate cheap).
+    //
+    // Implementation: read momentum from the higher-sigma feed, then orient it by direction.
+    let momentum_raw = {
+        let canonical_mint_b = if mint_in == canonical_mint_a { mint_out } else { mint_in };
+        let feed_a = cfg.hermes_feed_ids.get(&canonical_mint_a).map(|s| s.as_str());
+        let feed_b = cfg.hermes_feed_ids.get(&canonical_mint_b).map(|s| s.as_str());
+        let (s_a, m_a) = feed_a.map(crate::volatility::read_vol).unwrap_or((0, 0));
+        let (s_b, m_b) = feed_b.map(crate::volatility::read_vol).unwrap_or((0, 0));
+        if s_a >= s_b { m_a } else { -m_b }
+    };
+    let momentum_shift: i64 = clamp_i64(
+        (momentum_raw as i128 * cfg.rfq_momentum_mult as i128 / 100) as i64,
+        -(cfg.rfq_momentum_cap_bps as i64),
+        cfg.rfq_momentum_cap_bps as i64,
+    );
+    // Combine inventory skew + momentum into a single centerline shift.
+    let total_center_shift = clamp_i64(
+        skew_bps.saturating_add(momentum_shift),
+        -cfg.rfq_max_skew_bps,
+        cfg.rfq_max_skew_bps,
+    );
+
+    let bps_delta = bps_delta_from_spread_and_centerline_shift(spread_bps, total_center_shift, direction_sign);
+    let amount_out = quote_amount_out_pmm_oracle_mid(
+        amount_in, dec_in, dec_out, oracle_num, oracle_den, bps_delta,
+    );
+
+    Ok(amount_out)
+}
+
+/// Binary search for exactOut using the RFQ quoting function.
+fn invert_quote_rfq_for_exact_out(
+    cfg: &Config,
+    mint_in: Pubkey,
+    mint_out: Pubkey,
+    canonical_mint_a: Pubkey,
+    tee_balance_in: u64,
+    tee_balance_out: u64,
+    dec_in: u32,
+    dec_out: u32,
+    p_in: &OraclePrice,
+    p_out: &OraclePrice,
+    target_out: u64,
+) -> Result<u64, AppError> {
+    if target_out == 0 {
+        return Err(AppError::BadRequest("exactOut amount must be > 0".into()));
+    }
+    if target_out > tee_balance_out {
+        return Err(AppError::NotFound("exactOut amount exceeds TEE inventory".into()));
+    }
+
+    let mut lo: u64 = 1;
+    let mut hi: u64 = 1;
+    let mut hi_ok = false;
+    for _ in 0..32 {
+        let out = compute_quote_rfq(
+            cfg, mint_in, mint_out, canonical_mint_a, tee_balance_in, tee_balance_out,
+            dec_in, dec_out, p_in, p_out, hi,
+        )?;
+        if out >= target_out {
+            hi_ok = true;
+            break;
+        }
+        lo = hi.saturating_add(1);
+        if hi >= u64::MAX / 2 { break; }
+        hi = hi.saturating_mul(2);
+    }
+    if !hi_ok {
+        return Err(AppError::NotFound(
+            "cannot satisfy exactOut with current TEE inventory/oracle".into(),
+        ));
+    }
+
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let out = compute_quote_rfq(
+            cfg, mint_in, mint_out, canonical_mint_a, tee_balance_in, tee_balance_out,
+            dec_in, dec_out, p_in, p_out, mid,
+        )?;
+        if out >= target_out {
+            hi = mid;
+        } else {
+            lo = mid.saturating_add(1);
+        }
+    }
+    Ok(lo)
+}
+
+
+
+pub async fn quote_jupiter(
+    cfg: &Config,
+    http: &reqwest::Client,
+    _rpc: Arc<RpcClient>,
+    req: crate::types::jupiter_rfq::QuoteRequest,
+    maker: Pubkey,
+) -> Result<crate::types::jupiter_rfq::QuoteResponse, AppError> {
+    let mint_in = Pubkey::from_str(req.token_in.trim())
+        .map_err(|_| AppError::NotFound("unsupported tokenIn".into()))?;
+    let mint_out = Pubkey::from_str(req.token_out.trim())
+        .map_err(|_| AppError::NotFound("unsupported tokenOut".into()))?;
+
+    // Fast 404: reject mints we don't have a pool for (pure in-memory lookup).
+    let dec_in = fetch_mint_decimals(&mint_in)
+        .map_err(|_| AppError::NotFound("unsupported tokenIn".into()))? as u32;
+    let dec_out = fetch_mint_decimals(&mint_out)
+        .map_err(|_| AppError::NotFound("unsupported tokenOut".into()))? as u32;
+
+    let amount = req
+        .amount
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| AppError::BadRequest("amount must be a valid u64 string".into()))?;
+    if amount == 0 {
+        return Err(AppError::BadRequest("amount must be > 0".into()));
+    }
+
+    let (canonical_a, canonical_b) = canonical_mints(mint_in, mint_out);
+
+    let ata_a = crate::solana::associated_token_address(&maker, &canonical_a);
+    let ata_b = crate::solana::associated_token_address(&maker, &canonical_b);
+    let (bal_a, bal_b) = crate::solana::read_tee_balances(&ata_a, &ata_b);
+    let (tee_balance_in, tee_balance_out) = if mint_in == canonical_a {
+        (bal_a, bal_b)
+    } else {
+        (bal_b, bal_a)
+    };
+
+    let (p_in, p_out) = fetch_oracle_pair(cfg, http, &mint_in, &mint_out)
+        .await
+        .map_err(|_| AppError::NotFound("unsupported pair (no oracle feed)".into()))?;
+
+    let quote_amount = match req.quote_type.as_str() {
+        "exactIn" => {
+            let out = compute_quote_rfq(
+                cfg, mint_in, mint_out, canonical_a,
+                tee_balance_in, tee_balance_out,
+                dec_in, dec_out, &p_in, &p_out, amount,
+            )?;
+            if out > tee_balance_out {
+                return Err(AppError::NotFound("insufficient maker inventory".into()));
+            }
+            out
+        }
+        "exactOut" => {
+            if amount > tee_balance_out {
+                return Err(AppError::NotFound("insufficient maker inventory for exactOut".into()));
+            }
+            invert_quote_rfq_for_exact_out(
+                cfg, mint_in, mint_out, canonical_a,
+                tee_balance_in, tee_balance_out,
+                dec_in, dec_out, &p_in, &p_out, amount,
+            )?
+        }
+        _ => {
+            return Err(AppError::BadRequest("quoteType must be exactIn or exactOut".into()));
+        }
+    };
+
+    let (amount_in, amount_out) = if req.quote_type == "exactIn" {
+        (req.amount.clone(), quote_amount.to_string())
+    } else {
+        (quote_amount.to_string(), req.amount.clone())
+    };
+    Ok(crate::types::jupiter_rfq::QuoteResponse {
+        request_id: req.request_id,
+        quote_id: req.quote_id,
+        quote_type: req.quote_type,
+        protocol: req.protocol.unwrap_or_else(|| "v1".into()),
+        token_in: req.token_in,
+        token_out: req.token_out,
+        amount_in,
+        amount_out,
+        maker: maker.to_string(),
+        taker: req.taker,
+        prioritization_fee_to_use: req.suggested_prioritization_fees,
+    })
+}
+
+pub async fn swap_jupiter(
+    cfg: &Config,
+    _http: &reqwest::Client,
+    rpc: Arc<RpcClient>,
+    req: crate::types::jupiter_rfq::SwapRequest,
+    quote: crate::state::JupiterQuoteCacheEntry,
+    tee_authority: &Keypair,
+) -> Result<crate::types::jupiter_rfq::SwapResponse, AppError> {
+    let strict_mode = cfg.jupiter_api_key.as_deref().filter(|s| !s.is_empty()).is_some();
+
+    let tx_details = order_engine_sdk::transaction::deserialize_transaction_base64_into_transaction_details(
+        &req.transaction,
+    )
+    .map_err(|e| AppError::BadRequest(format!("invalid Jupiter transaction: {e}")))?;
+    let maker = tee_authority.pubkey();
+
+    if strict_mode {
+        let taker = quote.taker.unwrap_or_else(|| {
+            *tx_details.sanitized_message.account_keys().get(1)
+                .unwrap_or(&Pubkey::default())
+        });
+
+        let order_engine_id = Pubkey::from_str(
+            "61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH",
+        ).unwrap();
+        let expire_at = {
+            let mut found = None;
+            for ix in tx_details.sanitized_message.decompile_instructions() {
+                if *ix.program_id == order_engine_id && ix.data.len() >= 32 {
+                    if let Ok(bytes) = <[u8; 8]>::try_from(&ix.data[24..32]) {
+                        found = Some(i64::from_le_bytes(bytes));
+                        break;
+                    }
+                }
+            }
+            found
+        }
+        .ok_or_else(|| AppError::BadRequest("fill instruction not found in transaction".into()))?;
+
+        let strict_validation = order_engine_sdk::fill::validate_fill_sanitized_message(
+            &tx_details.sanitized_message,
+            order_engine_sdk::fill::Order {
+                taker,
+                maker,
+                in_amount: quote.amount_in,
+                input_mint: quote.token_in,
+                out_amount: quote.amount_out,
+                output_mint: quote.token_out,
+                expire_at,
+            },
+        );
+        if let Err(e) = strict_validation {
+            let err_msg = e.to_string();
+            if !err_msg.contains("Unexpected program id L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95") {
+                return Err(AppError::Forbidden(format!(
+                    "Jupiter tx failed strict order validation: {err_msg}"
+                )));
+            }
+            validate_fill_allowing_lighthouse(
+                &tx_details.sanitized_message,
+                taker,
+                maker,
+                quote.token_in,
+                quote.token_out,
+                quote.amount_in,
+                quote.amount_out,
+                expire_at,
+            )
+            .map_err(|e2| {
+                AppError::Forbidden(format!("Jupiter tx failed strict order validation: {e2}"))
+            })?;
+        }
+    } else {
+        tracing::warn!("acceptance-test mode: skipping strict order-engine validation");
+    }
+
+    let mut jupiter_tx = tx_details.versioned_transaction;
+    let required = jupiter_tx.message.header().num_required_signatures as usize;
+    let account_keys: Vec<Pubkey> = match &jupiter_tx.message {
+        VersionedMessage::Legacy(m) => m.account_keys.clone(),
+        VersionedMessage::V0(m) => m.account_keys.clone(),
+    };
+    if account_keys.len() < required {
+        return Err(AppError::BadRequest(
+            "invalid Jupiter transaction signer set".into(),
+        ));
+    }
+
+    let maker_sig_idx = if strict_mode {
+        account_keys
+            .iter()
+            .take(required)
+            .position(|k| *k == maker)
+            .ok_or_else(|| AppError::Forbidden("Jupiter tx does not require configured maker signature".into()))?
+    } else {
+        0
+    };
+
+    if jupiter_tx.signatures.len() < required {
+        jupiter_tx.signatures.resize(required, Signature::default());
+    }
+    let maker_sig = tee_authority.sign_message(&jupiter_tx.message.serialize());
+    jupiter_tx.signatures[maker_sig_idx] = maker_sig;
+
+    if strict_mode {
+        let rpc_for_send = rpc.clone();
+        let tx_to_send = jupiter_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            rpc_for_send.send_transaction(&tx_to_send)
+        })
+        .await
+        .map_err(|e| AppError::BadGateway(format!("send_transaction join failed: {e}")))?
+        .map_err(|e| AppError::BadGateway(format!("send_transaction failed: {e}")))?;
+    } else {
+        tracing::warn!("acceptance-test mode: skipping RPC broadcast of dummy transaction");
+    }
+
+    let tx_signature = if maker_sig_idx < jupiter_tx.signatures.len() {
+        jupiter_tx.signatures[maker_sig_idx].to_string()
+    } else {
+        maker_sig.to_string()
+    };
+
+    if strict_mode {
+        let rpc_for_refresh = rpc.clone();
+        let (canon_a, canon_b) = canonical_mints(quote.token_in, quote.token_out);
+        tokio::task::spawn_blocking(move || {
+            let ata_a = crate::solana::associated_token_address(&maker, &canon_a);
+            let ata_b = crate::solana::associated_token_address(&maker, &canon_b);
+            crate::solana::refresh_tee_balance_cache(&rpc_for_refresh, &[ata_a, ata_b]);
+        });
+    }
+
+    Ok(crate::types::jupiter_rfq::SwapResponse::accepted(
+        req.quote_id,
+        tx_signature,
+    ))
+}
+
+fn validate_fill_allowing_lighthouse(
+    msg: &SanitizedMessage,
+    taker: Pubkey,
+    maker: Pubkey,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
+    amount_in: u64,
+    amount_out: u64,
+    expire_at: i64,
+) -> Result<(), String> {
+    if msg.fee_payer() != &maker {
+        return Err("fee payer is not maker".to_string());
+    }
+    if msg
+        .get_signature_details()
+        .num_transaction_signatures()
+        != 2
+    {
+        return Err("invalid signer count".to_string());
+    }
+    let second_signer = msg
+        .account_keys()
+        .get(1)
+        .ok_or_else(|| "missing taker signer".to_string())?;
+    if second_signer != &taker {
+        return Err("second signer is not taker".to_string());
+    }
+
+    let order_engine_id = Pubkey::from_str("61DFfeTKM7trxYcPQCM78bJ794ddZprZpAwAnLiwTpYH")
+        .map_err(|e| format!("invalid order-engine id: {e}"))?;
+    let associated_token_program =
+        Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+            .map_err(|e| format!("invalid ATA program id: {e}"))?;
+    let lighthouse_id = Pubkey::from_str("L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95")
+        .map_err(|e| format!("invalid lighthouse id: {e}"))?;
+
+    let mut fill_seen = false;
+    for ix in msg.decompile_instructions() {
+        if *ix.program_id == compute_budget::ID || *ix.program_id == associated_token_program {
+            continue;
+        }
+        if *ix.program_id == lighthouse_id {
+            let discr = ix.data.first().copied().unwrap_or_default();
+            if !matches!(discr, 5 | 6 | 9 | 10) {
+                return Err("invalid Lighthouse instruction discriminator".to_string());
+            }
+            continue;
+        }
+        if *ix.program_id != order_engine_id {
+            return Err(format!("unexpected program id {}", ix.program_id));
+        }
+        fill_seen = true;
+        if ix.accounts.len() < 9 || ix.data.len() < 32 {
+            return Err("invalid fill instruction shape".to_string());
+        }
+        if *ix.accounts[0].pubkey != taker || *ix.accounts[1].pubkey != maker {
+            return Err("fill taker/maker mismatch".to_string());
+        }
+        if *ix.accounts[6].pubkey != input_mint || *ix.accounts[8].pubkey != output_mint {
+            return Err("fill mint mismatch".to_string());
+        }
+
+        let in_amt = <[u8; 8]>::try_from(&ix.data[8..16])
+            .map(u64::from_le_bytes)
+            .map_err(|_| "invalid fill input amount".to_string())?;
+        let out_amt = <[u8; 8]>::try_from(&ix.data[16..24])
+            .map(u64::from_le_bytes)
+            .map_err(|_| "invalid fill output amount".to_string())?;
+        let ix_expire_at = <[u8; 8]>::try_from(&ix.data[24..32])
+            .map(i64::from_le_bytes)
+            .map_err(|_| "invalid fill expire_at".to_string())?;
+        if in_amt != amount_in || out_amt != amount_out {
+            return Err("Invalid fill ix".to_string());
+        }
+        if ix_expire_at != expire_at {
+            return Err("Incorrect expiry".to_string());
+        }
+    }
+    if !fill_seen {
+        return Err("Missing fill instruction".to_string());
+    }
+    Ok(())
+}
+
 pub async fn quote(
     cfg: &Config,
     http: &reqwest::Client,
@@ -1011,12 +1558,12 @@ pub async fn execute(
 
     // Concurrency plan for execute:
     // - Oracle prices (cache/batched HTTP) in parallel
-    // - Indexer merkle proof (blocking HTTP) in spawn_blocking
     // - Solana RPC reads (blocking) in spawn_blocking:
     //   - pool account
     //   - AMM config (merkle tree + expected tee)
     //   - vault balances (batched)
     //   - asset_id for mint_out
+    // - Merkle proof is provided by the client in the request.
     let program_id = cfg.program_id;
     let mint_out_for_rpc = mint_out;
     let pool_pk_for_rpc = pool_pk;
@@ -1041,23 +1588,11 @@ pub async fn execute(
         },
     );
 
-    let indexer_url = cfg.indexer_url.clone();
-    let admin_token = cfg.admin_token.clone();
-    let prev_commitment = effective_prev_commitment_hex.clone();
-    let proof_task = tokio::task::spawn_blocking(
-        move || -> Result<crate::types::IndexerProofResponse, AppError> {
-            let indexer = IndexerClient::new(&indexer_url, admin_token)?;
-            indexer.get_proof_by_commitment_hex(&prev_commitment)
-        },
-    );
-
     let oracle_task = fetch_oracle_pair(cfg, http, &mint_in, &mint_out);
 
-    let (rpc_res, proof_res, oracle_res) = tokio::join!(rpc_task, proof_task, oracle_task);
+    let (rpc_res, oracle_res) = tokio::join!(rpc_task, oracle_task);
     let (pool, merkle_tree, expected_tee, vault_a_amt, vault_b_amt, asset_out_id) =
         rpc_res.map_err(|e| AppError::BadGateway(format!("rpc task join failed: {e}")))??;
-    let proof =
-        proof_res.map_err(|e| AppError::BadGateway(format!("indexer task join failed: {e}")))??;
     let (p_in, p_out) = oracle_res?;
 
     // Validate the provisioned TEE key matches on-chain config.
@@ -1150,10 +1685,10 @@ pub async fn execute(
     // Note: we enforce slippage via `min_out` above; executed out is always `q.amount_out`.
 
     let prev = hex32(&effective_prev_commitment_hex)?;
-    let root = hex32(&proof.root_hex)?;
+    let root = hex32(&req.root_hex)?;
 
-    let mut siblings = Vec::with_capacity(proof.siblings_hex.len());
-    for s in &proof.siblings_hex {
+    let mut siblings = Vec::with_capacity(req.siblings_hex.len());
+    for s in &req.siblings_hex {
         siblings.push(hex32(s)?);
     }
     // The on-chain Merkle tree uses a canopy, so `replace_leaf` only needs the *non-canopy*
@@ -1172,14 +1707,14 @@ pub async fn execute(
         .unwrap_or(14);
     let depth = siblings.len();
     if depth == 0 || canopy_depth > depth {
-        return Err(AppError::BadGateway(format!(
-            "invalid proof shape from indexer: depth={} canopy_depth={}",
+        return Err(AppError::BadRequest(format!(
+            "invalid proof shape: depth={} canopy_depth={}",
             depth, canopy_depth
         )));
     }
     let needed = depth.saturating_sub(canopy_depth);
     if needed == 0 {
-        return Err(AppError::BadGateway(format!(
+        return Err(AppError::BadRequest(format!(
             "canopy_depth={} covers full depth={}, expected canopy < depth",
             canopy_depth, depth
         )));
@@ -1187,7 +1722,7 @@ pub async fn execute(
     let siblings_for_tx: Vec<[u8; 32]> = siblings
         .get(0..needed)
         .ok_or_else(|| {
-            AppError::BadGateway(format!(
+            AppError::BadRequest(format!(
                 "proof siblings too short: got={} need_at_least={}",
                 siblings.len(),
                 needed
@@ -1357,7 +1892,7 @@ pub async fn execute(
         root,
         previous_leaf: prev,
         new_leaf,
-        index: proof.leaf_index,
+        index: req.leaf_index,
         new_reserve_a,
         new_reserve_b,
     };

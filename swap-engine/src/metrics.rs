@@ -29,6 +29,21 @@ pub struct Metrics {
     pub quote_pool_rpc_ms: Histogram,
     pub quote_oracle_ms: Histogram,
     pub quote_compute_ms: Histogram,
+    pub jupiter_quote_requests_total: Counter,
+    pub jupiter_swap_requests_total: Counter,
+    pub jupiter_fills_total: Counter,
+    pub jupiter_fill_volume_in_base_total: Counter,
+    pub jupiter_fill_volume_out_base_total: Counter,
+    #[allow(dead_code)]
+    pub jupiter_bundle_submitted_total: Counter,
+    #[allow(dead_code)]
+    pub jupiter_bundle_landed_total: Counter,
+    #[allow(dead_code)]
+    pub jupiter_bundle_failed_total: Counter,
+    pub jupiter_quote_ms: Histogram,
+    pub jupiter_swap_ms: Histogram,
+
+    pub cex_breaker_trips_total: Counter,
 
     // Solvency gauges (computed from on-chain pool + vaults).
     pub solvency_ok: Gauge<i64>,
@@ -126,6 +141,73 @@ pub fn metrics() -> &'static Metrics {
             "Quote: pure compute/policy latency (ms) (no network)",
             quote_compute_ms.clone(),
         );
+        let jupiter_quote_requests_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_quote_requests_total",
+            "Jupiter quote requests total",
+            jupiter_quote_requests_total.clone(),
+        );
+        let jupiter_swap_requests_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_swap_requests_total",
+            "Jupiter swap requests total",
+            jupiter_swap_requests_total.clone(),
+        );
+        let jupiter_fills_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_fills_total",
+            "Jupiter fills accepted total",
+            jupiter_fills_total.clone(),
+        );
+        let jupiter_fill_volume_in_base_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_fill_volume_in_base_total",
+            "Jupiter accepted volume in base units (input side)",
+            jupiter_fill_volume_in_base_total.clone(),
+        );
+        let jupiter_fill_volume_out_base_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_fill_volume_out_base_total",
+            "Jupiter accepted volume in base units (output side)",
+            jupiter_fill_volume_out_base_total.clone(),
+        );
+        let jupiter_bundle_submitted_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_bundle_submitted_total",
+            "Jupiter bundles submitted to Jito total",
+            jupiter_bundle_submitted_total.clone(),
+        );
+        let jupiter_bundle_landed_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_bundle_landed_total",
+            "Jupiter bundles landed total (updated when landing tracking is wired)",
+            jupiter_bundle_landed_total.clone(),
+        );
+        let jupiter_bundle_failed_total = Counter::default();
+        registry.register(
+            "swap_engine_jupiter_bundle_failed_total",
+            "Jupiter bundles failed total",
+            jupiter_bundle_failed_total.clone(),
+        );
+        let jupiter_quote_ms = Histogram::new(buckets_ms().into_iter());
+        registry.register(
+            "swap_engine_jupiter_quote_ms",
+            "Jupiter quote handler latency (ms)",
+            jupiter_quote_ms.clone(),
+        );
+        let jupiter_swap_ms = Histogram::new(buckets_ms().into_iter());
+        registry.register(
+            "swap_engine_jupiter_swap_ms",
+            "Jupiter swap handler latency (ms)",
+            jupiter_swap_ms.clone(),
+        );
+
+        let cex_breaker_trips_total = Counter::default();
+        registry.register(
+            "swap_engine_cex_breaker_trips_total",
+            "CEX circuit breaker trips (Pyth/Binance deviation exceeded threshold)",
+            cex_breaker_trips_total.clone(),
+        );
 
         let solvency_ok = Gauge::<i64>::default();
         registry.register("swap_engine_solvency_ok", "1 if solvent, 0 otherwise", solvency_ok.clone());
@@ -159,6 +241,17 @@ pub fn metrics() -> &'static Metrics {
             quote_pool_rpc_ms,
             quote_oracle_ms,
             quote_compute_ms,
+            jupiter_quote_requests_total,
+            jupiter_swap_requests_total,
+            jupiter_fills_total,
+            jupiter_fill_volume_in_base_total,
+            jupiter_fill_volume_out_base_total,
+            jupiter_bundle_submitted_total,
+            jupiter_bundle_landed_total,
+            jupiter_bundle_failed_total,
+            jupiter_quote_ms,
+            jupiter_swap_ms,
+            cex_breaker_trips_total,
             solvency_ok,
             solvency_pool,
             solvency_mint,
@@ -177,7 +270,6 @@ fn refresh_solvency_metrics(st: &AppState) {
             crate::solvency::SolvencyResponse {
                 ok: false,
                 program_id: st.cfg.program_id.to_string(),
-                indexer_url: st.cfg.indexer_url.clone(),
                 ts_ms: 0,
                 mints: vec![],
                 pools: vec![],
@@ -198,7 +290,6 @@ fn refresh_solvency_metrics(st: &AppState) {
         if let Ok(snap) = compute_solvency(ComputeSolvencyParams {
             rpc: &rpc,
             program_id: st.cfg.program_id,
-            indexer_url: st.cfg.indexer_url.clone(),
         }) {
             *last = snap;
             *last_ms = now;

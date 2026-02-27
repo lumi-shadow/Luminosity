@@ -30,7 +30,6 @@ pub async fn health_solvency(State(st): State<AppState>) -> ApiResult<crate::sol
     match solvency::compute_solvency(solvency::ComputeSolvencyParams {
         rpc: &st.rpc_confirmed,
         program_id: st.cfg.program_id,
-        indexer_url: st.cfg.indexer_url.clone(),
     }) {
         Ok(v) => Ok(Json(v)),
         Err(e) => api_err(e),

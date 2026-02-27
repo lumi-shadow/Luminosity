@@ -56,3 +56,12 @@ pub fn header_bearer_token(headers: &HeaderMap) -> Option<String> {
     }
 }
 
+pub fn header_x_api_key(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.contains('\r') && !s.contains('\n'))
+        .filter(|s| !s.is_empty())
+}
+

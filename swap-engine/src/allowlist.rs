@@ -123,7 +123,7 @@ pub async fn require_allowlisted_ip(
                 return (
                     axum::http::StatusCode::FORBIDDEN,
                     AxumJson(ErrorBody {
-                        error: "connect info missing (allowlist-only)".into(),
+                        message: "connect info missing (allowlist-only)".into(),
                     }),
                 )
                     .into_response();
@@ -151,7 +151,7 @@ pub async fn require_allowlisted_ip(
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     AxumJson(ErrorBody {
-                        error: "allowlist lock poisoned (allowlist-only)".into(),
+                        message: "allowlist lock poisoned (allowlist-only)".into(),
                     }),
                 )
                     .into_response();
@@ -163,7 +163,7 @@ pub async fn require_allowlisted_ip(
         return (
             axum::http::StatusCode::FORBIDDEN,
             AxumJson(ErrorBody {
-                error: "ip not allowlisted".into(),
+                message: "ip not allowlisted".into(),
             }),
         )
             .into_response();
@@ -175,7 +175,7 @@ pub async fn get_allowlist(State(st): State<AppState>) -> ApiResult<AllowlistRes
     let nets = st
         .allowlist
         .read()
-        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, AxumJson(crate::types::ErrorBody{ error: "allowlist lock poisoned".into()})))?;
+        .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, AxumJson(crate::types::ErrorBody{ message: "allowlist lock poisoned".into()})))?;
     Ok(AxumJson(AllowlistResponse {
         allowlist: nets.iter().map(|n| n.to_string()).collect(),
     }))
@@ -189,7 +189,7 @@ pub async fn put_allowlist(
         (
             e.status_code(),
             AxumJson(ErrorBody {
-                error: e.to_string(),
+                message: e.to_string(),
             }),
         )
     })?;
@@ -198,7 +198,7 @@ pub async fn put_allowlist(
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(crate::types::ErrorBody {
-                    error: "allowlist lock poisoned".into(),
+                    message: "allowlist lock poisoned".into(),
                 }),
             )
         })?;
@@ -208,7 +208,7 @@ pub async fn put_allowlist(
         (
             e.status_code(),
             AxumJson(ErrorBody {
-                error: e.to_string(),
+                message: e.to_string(),
             }),
         )
     })?;
@@ -232,7 +232,7 @@ pub async fn post_allowlist_self(
             (
                 e.status_code(),
                 AxumJson(ErrorBody {
-                    error: e.to_string(),
+                    message: e.to_string(),
                 }),
             )
         })?;
@@ -241,7 +241,7 @@ pub async fn post_allowlist_self(
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 AxumJson(crate::types::ErrorBody {
-                    error: "allowlist lock poisoned".into(),
+                    message: "allowlist lock poisoned".into(),
                 }),
             )
         })?;
@@ -254,7 +254,7 @@ pub async fn post_allowlist_self(
         (
             e.status_code(),
             AxumJson(ErrorBody {
-                error: e.to_string(),
+                message: e.to_string(),
             }),
         )
     })?;

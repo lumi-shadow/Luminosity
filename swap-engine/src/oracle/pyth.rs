@@ -64,6 +64,8 @@ pub fn get_cached_hermes_price(feed_id_hex: &str) -> Option<OraclePrice> {
 fn upsert_cached_prices(prices: HashMap<String, OraclePrice>) {
     if let Ok(mut g) = hermes_cache().write() {
         for (k, v) in prices {
+            crate::volatility::observe_price(&k, v.price);
+            crate::volatility::observe_confidence(&k, v.conf, v.price);
             g.insert(k, v);
         }
     }

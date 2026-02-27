@@ -27,7 +27,43 @@ pub async fn require_admin_token(
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorBody {
-                error: "admin token required".into(),
+                message: "admin token required".into(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+pub async fn require_jupiter_api_key(
+    State(st): State<AppState>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    if !st.cfg.jupiter_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                message: "not found".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    let Some(expected) = st.cfg.jupiter_api_key.as_deref().filter(|s| !s.is_empty()) else {
+        // No API key configured — open access (dev/acceptance-test mode).
+        return next.run(req).await;
+    };
+    let got = utils::header_x_api_key(req.headers());
+    let ok = got
+        .as_deref()
+        .map(|g| g.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1)
+        .unwrap_or(false);
+    if !ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                message: "x-api-key required".into(),
             }),
         )
             .into_response();

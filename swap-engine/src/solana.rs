@@ -13,13 +13,16 @@ use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::message::Message;
+use solana_sdk::message::VersionedMessage;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 #[allow(deprecated)]
 use solana_sdk::system_program;
 use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::VersionedTransaction;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -30,6 +33,7 @@ use solana_transaction_status::TransactionConfirmationStatus;
 pub const SPL_ACCOUNT_COMPRESSION_PROGRAM_ID: &str = "cmtDvXumGCrqC1Age74AVPhSRVXJMd8PJS91L8KbNCK";
 pub const SPL_NOOP_PROGRAM_ID: &str = "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV";
 pub const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const SPL_ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
 static MINT_DECIMALS_CACHE: OnceLock<HashMap<Pubkey, u8>> = OnceLock::new();
 static POOL_CACHE: OnceLock<RwLock<HashMap<Pubkey, (PoolAccount, u128)>>> = OnceLock::new();
@@ -290,6 +294,87 @@ pub fn fetch_pool_cached(rpc: &RpcClient, pool: &Pubkey) -> Result<PoolAccount, 
     Ok(p)
 }
 
+// --- TEE balance cache ---
+// The quote hot-path ONLY reads from this atomic cache — zero RPC, zero locks.
+// A background loop refreshes the values every ~2 seconds.
+// Fill/rebalance handlers trigger an immediate async refresh.
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct TeeBalanceSlot {
+    balance_a: AtomicU64,
+    balance_b: AtomicU64,
+    ata_a: OnceLock<Pubkey>,
+    ata_b: OnceLock<Pubkey>,
+}
+
+static TEE_BAL_SLOT: TeeBalanceSlot = TeeBalanceSlot {
+    balance_a: AtomicU64::new(0),
+    balance_b: AtomicU64::new(0),
+    ata_a: OnceLock::new(),
+    ata_b: OnceLock::new(),
+};
+
+/// Read TEE balances from the atomic cache. Pure memory read, no RPC, no locks.
+/// Returns (0, 0) if the cache hasn't been populated yet (pre-first-refresh).
+pub fn read_tee_balances(ata_a: &Pubkey, ata_b: &Pubkey) -> (u64, u64) {
+    let cached_a = TEE_BAL_SLOT.ata_a.get();
+    let cached_b = TEE_BAL_SLOT.ata_b.get();
+    if cached_a == Some(ata_a) && cached_b == Some(ata_b) {
+        (
+            TEE_BAL_SLOT.balance_a.load(Ordering::Relaxed),
+            TEE_BAL_SLOT.balance_b.load(Ordering::Relaxed),
+        )
+    } else {
+        (0, 0)
+    }
+}
+
+/// Refresh TEE balance cache from RPC. Called by background loop and post-fill/rebalance.
+pub fn refresh_tee_balance_cache(rpc: &RpcClient, atas: &[Pubkey; 2]) {
+    match fetch_token_account_amounts(rpc, atas) {
+        Ok(amounts) => {
+            let a = amounts.first().copied().flatten().unwrap_or(0);
+            let b = amounts.get(1).copied().flatten().unwrap_or(0);
+            let _ = TEE_BAL_SLOT.ata_a.set(atas[0]);
+            let _ = TEE_BAL_SLOT.ata_b.set(atas[1]);
+            TEE_BAL_SLOT.balance_a.store(a, Ordering::Relaxed);
+            TEE_BAL_SLOT.balance_b.store(b, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!("refresh_tee_balance_cache RPC failed: {e}");
+        }
+    }
+}
+
+/// Spawn a background loop that refreshes TEE balances every `interval` from RPC.
+pub fn spawn_tee_balance_refresher(
+    rpc: Arc<RpcClient>,
+    maker: Pubkey,
+    mint_a: Pubkey,
+    mint_b: Pubkey,
+    interval: std::time::Duration,
+) {
+    let ata_a = associated_token_address(&maker, &mint_a);
+    let ata_b = associated_token_address(&maker, &mint_b);
+    let atas = [ata_a, ata_b];
+
+    // Seed the cache synchronously before returning so first quote is warm.
+    refresh_tee_balance_cache(&rpc, &atas);
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let rpc_c = rpc.clone();
+            let atas_c = atas;
+            tokio::task::spawn_blocking(move || {
+                refresh_tee_balance_cache(&rpc_c, &atas_c);
+            });
+        }
+    });
+}
+
 pub fn fetch_token_account_amounts(
     rpc: &RpcClient,
     token_accounts: &[Pubkey],
@@ -370,6 +455,74 @@ pub fn fetch_mint_decimals(mint: &Pubkey) -> Result<u8, AppError> {
             "unknown mint (decimals not cached from registry pools): {mint}"
         ))
     })
+}
+
+pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static");
+    let ata_program = Pubkey::from_str(SPL_ASSOCIATED_TOKEN_PROGRAM_ID).expect("static");
+    Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &ata_program,
+    )
+    .0
+}
+
+#[allow(dead_code)]
+pub fn recent_blockhash_from_versioned(vtx: &VersionedTransaction) -> solana_sdk::hash::Hash {
+    match &vtx.message {
+        VersionedMessage::Legacy(m) => m.recent_blockhash,
+        VersionedMessage::V0(m) => m.recent_blockhash,
+    }
+}
+
+pub fn build_rebalance_tx(
+    program_id: Pubkey,
+    pool_pubkey: Pubkey,
+    pool: &PoolAccount,
+    delta_a: i64,
+    delta_b: i64,
+    recent_blockhash: solana_sdk::hash::Hash,
+    tee_authority: &Keypair,
+) -> Result<Transaction, AppError> {
+    let token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM_ID).expect("static");
+    let (amm, _bump) = amm_pda(&program_id);
+    let tee_pk = tee_authority.pubkey();
+
+    let tee_ata_a = associated_token_address(&tee_pk, &pool.mint_a);
+    let tee_ata_b = associated_token_address(&tee_pk, &pool.mint_b);
+
+    let mut data = Vec::with_capacity(8 + 8 + 8);
+    data.extend_from_slice(&anchor_discriminator("rebalance"));
+    data.extend_from_slice(&delta_a.to_le_bytes());
+    data.extend_from_slice(&delta_b.to_le_bytes());
+
+    let ata_program = Pubkey::from_str(SPL_ASSOCIATED_TOKEN_PROGRAM_ID).expect("static");
+
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(amm, false),
+            AccountMeta::new_readonly(tee_pk, true),
+            AccountMeta::new(pool_pubkey, false),
+            AccountMeta::new(pool.vault_a, false),
+            AccountMeta::new(pool.vault_b, false),
+            AccountMeta::new(tee_ata_a, false),
+            AccountMeta::new(tee_ata_b, false),
+            AccountMeta::new_readonly(pool.mint_a, false),
+            AccountMeta::new_readonly(pool.mint_b, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(ata_program, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&tee_pk),
+        &[tee_authority],
+        recent_blockhash,
+    );
+    Ok(tx)
 }
 
 #[derive(BorshDeserialize)]

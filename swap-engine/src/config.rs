@@ -1,7 +1,7 @@
 //! Environment-driven configuration for `swap-engine`.
 //!
 //! We keep this intentionally small and explicit:
-//! - RPC + indexer endpoints
+//! - RPC endpoint
 //! - program id
 //! - keypairs for signing
 //! - oracle settings + feed mapping (mint -> pyth price account)
@@ -30,8 +30,6 @@ pub struct Config {
     pub admin_token: String,
     /// Solana HTTP RPC endpoint (Helius, etc).
     pub rpc_url: String,
-    /// Base URL for the local tree-indexer, e.g. `http://127.0.0.1:8787`.
-    pub indexer_url: String,
     /// Anchor program id (privacy pool).
     pub program_id: Pubkey,
     /// Optional path to JSON keypair file used as `tee_authority` signer on-chain.
@@ -113,6 +111,56 @@ pub struct Config {
     pub rebalance_min_deviation_bps: u64,
     /// Hard cap on the positive bonus (bps).
     pub rebalance_max_bonus_bps: u64,
+
+    /// Enable Jupiter RFQ webhook routes.
+    pub jupiter_enabled: bool,
+    /// Shared secret expected in `X-API-KEY` for Jupiter routes.
+    pub jupiter_api_key: Option<String>,
+
+    /// Interval (seconds) for the background rebalance loop (TEE <-> pool vaults).
+    pub rebalance_interval_secs: u64,
+    /// Trigger rebalance when TEE inventory drifts more than this % from target.
+    pub rebalance_threshold_pct: u64,
+
+    // --- RFQ-specific quoting (Jupiter path) ---
+    /// Base spread for RFQ quotes (bps). Typically tighter than web DEX.
+    pub rfq_base_spread_bps: u64,
+    /// Hard cap on RFQ spread (bps).
+    pub rfq_max_spread_bps: u64,
+    /// Inventory skew sensitivity for the TEE wallet (bps).
+    /// Skew is computed from TEE ATA balances, not pool reserves.
+    /// `skew_bps = clamp(imbalance_bps * rfq_skew_k_bps / 10_000, ±rfq_max_skew_bps)`
+    pub rfq_skew_k_bps: i64,
+    /// Clamp for RFQ skew_bps (absolute value).
+    pub rfq_max_skew_bps: i64,
+    /// Imbalance must exceed this threshold (bps) before any skew is applied.
+    /// Prevents tiny natural fluctuations from widening quotes.
+    pub rfq_skew_deadzone_bps: i64,
+
+    /// Oracle staleness penalty for RFQ (bps per second).
+    pub rfq_stale_spread_bps_per_sec: u64,
+
+    // --- RFQ volatility-adaptive spread (adverse selection protection) ---
+    // Oracle confidence is fed directly into the volatility tracker via
+    // `observe_confidence`, so there's no separate conf multiplier here.
+    /// Multiplier for sigma_bps contribution to spread:
+    ///   vol_spread_bps = sigma_bps * rfq_vol_spread_mult / 100
+    /// 100 = 1.0x, 200 = 2.0x the raw sigma.
+    pub rfq_vol_spread_mult: u64,
+    /// Multiplier for momentum_bps contribution to mid-price shift:
+    ///   mid_shift_bps = momentum_bps * rfq_momentum_mult / 100
+    /// Positive shift = the side that's moving against you gets wider.
+    pub rfq_momentum_mult: u64,
+    /// Cap on the volatility-driven spread addition (bps).
+    pub rfq_vol_spread_cap_bps: u64,
+    /// Cap on the momentum-driven mid shift (bps).
+    pub rfq_momentum_cap_bps: u64,
+
+    // --- CEX circuit breaker (Binance WS sanity check) ---
+    /// Enable the Binance WebSocket feed as a Pyth oracle sanity check.
+    pub cex_circuit_breaker_enabled: bool,
+    /// Max allowed Pyth-vs-Binance deviation before rejecting quotes (bps).
+    pub cex_deviation_threshold_bps: u64,
 }
 
 fn env_required(key: &str) -> anyhow::Result<String> {
@@ -185,7 +233,6 @@ pub fn load_config() -> anyhow::Result<Config> {
     }
 
     let rpc_url = env_required("RPC_URL")?;
-    let indexer_url = env_required("INDEXER_URL")?;
     let program_id =
         Pubkey::from_str(&env_required("PROGRAM_ID")?).context("Invalid PROGRAM_ID")?;
 
@@ -261,6 +308,32 @@ pub fn load_config() -> anyhow::Result<Config> {
     let rebalance_bonus_bps = env_u64("REBALANCE_BONUS_BPS", 0);
     let rebalance_min_deviation_bps = env_u64("REBALANCE_MIN_DEVIATION_BPS", 200);
     let rebalance_max_bonus_bps = env_u64("REBALANCE_MAX_BONUS_BPS", 50);
+    let jupiter_enabled = env_bool("JUPITER_ENABLED", false);
+    let jupiter_api_key = env::var("JUPITER_API_KEY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if jupiter_enabled && jupiter_api_key.is_none() {
+        tracing::warn!("JUPITER_ENABLED=true without JUPITER_API_KEY — routes are open (dev/test mode)");
+    }
+    let rebalance_interval_secs = env_u64("REBALANCE_INTERVAL_SECS", 60);
+    let rebalance_threshold_pct = env_u64("REBALANCE_THRESHOLD_PCT", 20);
+
+    // RFQ quoting: flat spread, no size penalty, no CPMM cap.
+    let mut rfq_base_spread_bps = env_u64("RFQ_BASE_SPREAD_BPS", 1);
+    let mut rfq_max_spread_bps = env_u64("RFQ_MAX_SPREAD_BPS", 50);
+    let rfq_skew_k_bps: i64 = env::var("RFQ_SKEW_K_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    let mut rfq_max_skew_bps: i64 = env::var("RFQ_MAX_SKEW_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let rfq_skew_deadzone_bps: i64 = env::var("RFQ_SKEW_DEADZONE_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_500); // only skew when >15% imbalanced
 
     // --- Safety clamps ---
     //
@@ -302,6 +375,34 @@ pub fn load_config() -> anyhow::Result<Config> {
         );
         max_skew_bps = max_skew_bps.signum() * MAX_SKEW_BPS_HARD_CAP;
     }
+    // RFQ clamps
+    if rfq_max_spread_bps >= 10_000 {
+        tracing::warn!("RFQ_MAX_SPREAD_BPS={} invalid; clamping to 9_999", rfq_max_spread_bps);
+        rfq_max_spread_bps = 9_999;
+    }
+    if rfq_base_spread_bps > rfq_max_spread_bps {
+        tracing::warn!("RFQ_BASE_SPREAD_BPS={} exceeds RFQ_MAX_SPREAD_BPS={}; clamping", rfq_base_spread_bps, rfq_max_spread_bps);
+        rfq_base_spread_bps = rfq_max_spread_bps;
+    }
+    if rfq_max_skew_bps.abs() >= 10_000 {
+        rfq_max_skew_bps = rfq_max_skew_bps.signum() * 9_999;
+    }
+    if rfq_max_skew_bps.abs() > MAX_SKEW_BPS_HARD_CAP {
+        rfq_max_skew_bps = rfq_max_skew_bps.signum() * MAX_SKEW_BPS_HARD_CAP;
+    }
+
+    let rfq_stale_spread_bps_per_sec = env_u64("RFQ_STALE_SPREAD_BPS_PER_SEC", 0);
+
+    // RFQ volatility-adaptive spread knobs
+    let rfq_vol_spread_mult = env_u64("RFQ_VOL_SPREAD_MULT", 200);    // 2.0x sigma
+    let rfq_momentum_mult = env_u64("RFQ_MOMENTUM_MULT", 150);        // 1.5x momentum
+    let rfq_vol_spread_cap_bps = env_u64("RFQ_VOL_SPREAD_CAP_BPS", 30); // max 30 bps from vol
+    let rfq_momentum_cap_bps = env_u64("RFQ_MOMENTUM_CAP_BPS", 20);    // max 20 bps mid shift
+
+    // CEX circuit breaker
+    let cex_circuit_breaker_enabled = env_bool("CEX_CIRCUIT_BREAKER_ENABLED", true);
+    let cex_deviation_threshold_bps = env_u64("CEX_DEVIATION_THRESHOLD_BPS", 15);
+
     // Skew divisor must be positive and not absurdly small.
     if skew_small_div_bps <= 0 {
         tracing::warn!("SKEW_SMALL_DIV_BPS={} invalid; defaulting to 250", skew_small_div_bps);
@@ -354,7 +455,6 @@ pub fn load_config() -> anyhow::Result<Config> {
     Ok(Config {
         admin_token,
         rpc_url,
-        indexer_url,
         program_id,
         tee_keypair,
         api_bind,
@@ -378,5 +478,21 @@ pub fn load_config() -> anyhow::Result<Config> {
         rebalance_bonus_bps,
         rebalance_min_deviation_bps,
         rebalance_max_bonus_bps,
+        jupiter_enabled,
+        jupiter_api_key,
+        rebalance_interval_secs,
+        rebalance_threshold_pct,
+        rfq_base_spread_bps,
+        rfq_max_spread_bps,
+        rfq_skew_k_bps,
+        rfq_max_skew_bps,
+        rfq_skew_deadzone_bps,
+        rfq_stale_spread_bps_per_sec,
+        rfq_vol_spread_mult,
+        rfq_momentum_mult,
+        rfq_vol_spread_cap_bps,
+        rfq_momentum_cap_bps,
+        cex_circuit_breaker_enabled,
+        cex_deviation_threshold_bps,
     })
 }

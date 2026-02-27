@@ -9,7 +9,7 @@ pub async fn job_status(State(st): State<AppState>, Path(id): Path<String>) -> A
         (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                error: "unknown job id".into(),
+                message: "unknown job id".into(),
             }),
         )
     })?;

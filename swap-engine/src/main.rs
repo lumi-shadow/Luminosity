@@ -7,7 +7,7 @@
 //! API shape:
 //! - `GET  /health`  -> simple liveness check
 //! - `POST /quote`   -> computes an indicative quote and returns whether it passes oracle band checks
-//! - `POST /execute` -> validates policy + fetches Merkle proof from indexer + submits tx (sync)
+//! - `POST /execute` -> validates policy + submits tx using client-provided Merkle proof (sync)
 //! - `POST /execute-job` -> same as execute, but returns immediately with `job_id` and runs async
 //!
 //! Notes on responsibilities:
@@ -19,9 +19,8 @@
 
 mod config;
 mod engine;
-mod http_client;
-mod indexer;
 mod oracle;
+mod rebalance;
 mod solana;
 mod solvency;
 mod types;
@@ -32,10 +31,12 @@ mod allowlist;
 mod handlers;
 mod router;
 mod state;
+mod volatility;
+mod cex_feed;
 
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::signature::{read_keypair_file, Keypair};
+use solana_sdk::signature::{read_keypair_file, Keypair, Signer};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -54,8 +55,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::load_config()?;
     info!(
-        "starting swap-engine (bind={}, program_id={}, indexer_url={})",
-        cfg.api_bind, cfg.program_id, cfg.indexer_url
+        "starting swap-engine (bind={}, program_id={})",
+        cfg.api_bind, cfg.program_id
     );
     info!(
         "quote policy: base_spread_bps={} max_spread_bps={} skew_k_bps={} max_skew_bps={} skew_small_div_bps={}",
@@ -114,6 +115,8 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter: Arc::new(tokio::sync::Mutex::new(rate_limit::RateLimiter::from_env())),
         allowlist: Arc::new(std::sync::RwLock::new(allowlist)),
         allowlist_path,
+        jupiter_quotes: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        jupiter_stats: Arc::new(state::JupiterRuntimeStats::new()),
     };
 
     // Optional: load keypairs from mounted files (not baked into the image).
@@ -159,6 +162,48 @@ async fn main() -> anyhow::Result<()> {
             info!("Hermes oracle cache disabled (ORACLE_CACHE_ENABLED=false)");
         }
     }
+    if state.cfg.cex_circuit_breaker_enabled {
+        cex_feed::spawn_binance_listener();
+        info!(
+            "started CEX circuit breaker (Binance WS, threshold={}bps)",
+            state.cfg.cex_deviation_threshold_bps
+        );
+    }
+
+    rebalance::spawn(
+        Arc::clone(&state.cfg),
+        Arc::clone(&state.rpc_confirmed),
+        Arc::clone(&state.tee_keypair),
+    );
+
+    // Background TEE balance refresher: keeps the atomic cache warm so the quote
+    // hot-path never touches RPC. Refreshes every 2 seconds + immediately on fill/rebalance.
+    {
+        let kp_guard = state.tee_keypair.lock().unwrap();
+        if let Some(kp) = kp_guard.as_ref() {
+            let maker = kp.pubkey();
+            drop(kp_guard);
+            // Discover mints from the first registered pool.
+            let pools = crate::solana::fetch_registry_pools(&state.rpc_confirmed, &state.cfg.program_id)
+                .unwrap_or_default();
+            if let Some(first_pool) = pools.first() {
+                if let Ok(pool) = crate::solana::fetch_pool(&state.rpc_confirmed, first_pool) {
+                    crate::solana::spawn_tee_balance_refresher(
+                        Arc::clone(&state.rpc_confirmed),
+                        maker,
+                        pool.mint_a,
+                        pool.mint_b,
+                        std::time::Duration::from_secs(2),
+                    );
+                    info!("started TEE balance refresher (every 2s, maker={})", maker);
+                }
+            }
+        } else {
+            drop(kp_guard);
+            info!("TEE keypair not loaded yet; TEE balance refresher will start on key upload");
+        }
+    }
+
     let bind = state.cfg.api_bind.clone();
 
     let app = router::build(state.clone());

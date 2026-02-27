@@ -5,7 +5,6 @@ use solana_sdk::pubkey::Pubkey;
 pub struct ComputeSolvencyParams<'a> {
     pub rpc: &'a RpcClient,
     pub program_id: Pubkey,
-    pub indexer_url: String,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -40,7 +39,6 @@ pub struct SolvencyPoolRow {
 pub struct SolvencyResponse {
     pub ok: bool,
     pub program_id: String,
-    pub indexer_url: String,
     pub ts_ms: u64,
     pub mints: Vec<SolvencyMintRow>,
     pub pools: Vec<SolvencyPoolRow>,
@@ -149,7 +147,6 @@ pub fn compute_solvency(params: ComputeSolvencyParams<'_>) -> Result<SolvencyRes
     Ok(SolvencyResponse {
         ok,
         program_id: params.program_id.to_string(),
-        indexer_url: params.indexer_url,
         ts_ms: (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

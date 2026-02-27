@@ -36,7 +36,8 @@ pub struct RelayProgressEvent {
 pub type ProgressTx = mpsc::Sender<RelayProgressEvent>;
 
 /// Browser-side payload (encrypted_blob decrypts into this).
-/// NOTE: Browser does NOT generate any proofs; enclave does.
+/// NOTE: Browser does NOT generate ZK proofs; the enclave does. But the browser provides the
+/// Merkle proof (tree witness) which is validated on-chain against the root changelog.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BrowserInputs {
     pub nullifier: String, // hex-encoded 32 bytes
@@ -51,6 +52,18 @@ pub struct BrowserInputs {
     /// The relayer no longer performs WSOL wrapping/unwrapping (tx size constraints).
     #[serde(default)]
     pub sol_destination: Option<String>,
+
+    // -----------------------------------------------------------------
+    // Client-provided Merkle proof (required).
+    // -----------------------------------------------------------------
+    /// Leaf index of the commitment in the Merkle tree.
+    pub leaf_index: u32,
+    /// On-chain Merkle root (hex, with or without `0x` prefix).
+    pub root_hex: String,
+    /// Sibling hashes from leaf to root (one per tree level, hex).
+    pub siblings_hex: Vec<String>,
+    /// Path direction bits (0=left, 1=right), one per tree level.
+    pub path_bits: Vec<u8>,
 }
 
 /// Browser-side payload for share-based liquidity withdrawals.
@@ -65,18 +78,13 @@ pub struct BrowserLiquidityInputs {
     /// Pool mints (base58). Relayer will canonicalize ordering.
     pub mint_a: String,
     pub mint_b: String,
-}
 
-#[derive(Debug, Deserialize)]
-pub struct IndexerProofResponse {
-    #[serde(rename = "commitment_hex")]
-    #[allow(dead_code)]
-    pub commitment_hex: String,
+    // -----------------------------------------------------------------
+    // Client-provided Merkle proof (required).
+    // -----------------------------------------------------------------
     pub leaf_index: u32,
-    #[serde(rename = "leaf_hex")]
-    pub leaf_hex: String,
     pub root_hex: String,
     pub siblings_hex: Vec<String>,
     pub path_bits: Vec<u8>,
-    pub depth: usize,
 }
+

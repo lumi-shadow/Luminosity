@@ -54,6 +54,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 x25519-dalek = "2.0"
 rand = "0.8"
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Decimal conversion for binding Groth16 public signal <-> 32-byte nullifier encoding
 num-bigint = "0.4"

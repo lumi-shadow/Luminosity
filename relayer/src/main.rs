@@ -76,10 +76,10 @@ use x25519_dalek::{EphemeralSecret as X25519EphemeralSecret, PublicKey as X25519
 // arkworks no longer needed in Circom-only relayer (keccak-based commitments)
 use crate::utils::{
     anchor_discriminator, associated_token_address, compute_commitment,
-    compute_commitment_liquidity, current_merkle_tree_pubkey, fetch_indexer_proof, g1_negate_y_be,
+    compute_commitment_liquidity, current_merkle_tree_pubkey, g1_negate_y_be,
     keccak256, merkle_root_from_witness, parse_first_json_value, registry_asset_id_for_mint,
     registry_pool_id_for_pool, spent_shard_pda, split_u128_be16_be16, tree_changelog_contains_root,
-    u256_be32_from_dec_str, IndexerProofLookup,
+    u256_be32_from_dec_str,
 };
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -87,7 +87,7 @@ use std::os::unix::process::ExitStatusExt;
 //  CONFIGURATION
 // ---------------------------------------------------------------------
 const DEFAULT_PROGRAM_ID: &str = "p1VaCyyfzodMni1tSYhvUFd3MyGB6sb6NRFWPixXD54";
-// Default to the public Solana mainnet RPC.
+// Default to the private RPC endpoint used by the frontend wallet connection.
 // Override via RPC_URL env at runtime (recommended for production).
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 // SP1 + ticket artifacts removed (Circom-only relayer).
@@ -875,7 +875,7 @@ async fn prepare_deposit_liquidity(
         ));
     }
 
-    let mut pre_ixs: Vec<Instruction> = Vec::new();
+    let pre_ixs: Vec<Instruction> = Vec::new();
     let post_ixs: Vec<Instruction> = Vec::new();
 
     // Instruction data:
@@ -1038,13 +1038,8 @@ async fn relay_circom_inner(
     // With bitmap nullification, the leaf index is the "spent key".
     // The nullifier remains a private note secret (used only inside the commitment),
     // but we do not publish or check its hash on-chain anymore.
-    let nullifier_bytes = hex::decode(&browser_inputs.nullifier)
+    let nullifier_bytes = parse_hex32_field("nullifier", &browser_inputs.nullifier)
         .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?;
-    if nullifier_bytes.len() != 32 {
-        return Err(AppError::BadRequest(
-            "nullifier must be 32 bytes (hex-encoded)".into(),
-        ));
-    }
 
     // -----------------------------------------------------------------
     // 4️⃣  Compute Merkle proof (relayer side)
@@ -1067,107 +1062,33 @@ async fn relay_circom_inner(
     let current_tree_pubkey = current_merkle_tree_pubkey(&state.rpc, &state.program_id)?;
 
     // -----------------------------------------------------------------
-    // 4️⃣a  Source-of-truth: tree-indexer HTTP API (required)
+    // 4️⃣a  Merkle proof: provided by the client (validated on-chain).
     // -----------------------------------------------------------------
-    let indexer_url = env::var("INDEXER_URL").map_err(|_| {
-        AppError::BadGateway("INDEXER_URL is required (relayer is indexer-only)".into())
-    })?;
-    let indexer_url = indexer_url.trim().trim_end_matches('/').to_string();
-    if indexer_url.is_empty() {
-        return Err(AppError::BadGateway(
-            "INDEXER_URL is required (relayer is indexer-only)".into(),
-        ));
-    }
-
     let commitment_hex = hex::encode(commitment);
-    utils::progress(&progress_tx, "indexer", "querying indexer for root+proof").await;
-    let (leaf_index, merkle_path, path_indices, root_hex) = match fetch_indexer_proof(
-        &indexer_url,
-        &commitment_hex,
-        &state.admin_token,
-    ) {
-        Ok(IndexerProofLookup::Found(p)) => {
-            if p.depth != MERKLE_TREE_DEPTH {
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned wrong depth (expected={} got={}): indexer={}",
-                    MERKLE_TREE_DEPTH, p.depth, indexer_url
-                )));
-            }
-            if p.siblings_hex.len() != MERKLE_TREE_DEPTH || p.path_bits.len() != MERKLE_TREE_DEPTH {
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned invalid proof shape (siblings={} path_bits={} expected={}): indexer={}",
-                    p.siblings_hex.len(),
-                    p.path_bits.len(),
-                    MERKLE_TREE_DEPTH,
-                    indexer_url
-                )));
-            }
-            // Fail fast: leaf returned by indexer must match the commitment we computed.
-            let leaf_bytes = parse_hex32_field("indexer.leaf_hex", &p.leaf_hex)?;
-            if leaf_bytes == [0u8; 32] {
-                metrics::inc_indexer_mismatch_total();
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned empty leaf for commitment={}: indexer={}",
-                    commitment_hex, indexer_url
-                )));
-            }
-            if leaf_bytes != commitment {
-                metrics::inc_indexer_mismatch_total();
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned non-matching leaf (commitment={} leaf_hex={}): indexer={}",
-                    commitment_hex,
-                    p.leaf_hex,
-                    indexer_url
-                )));
-            }
-            utils::progress(
-                &progress_tx,
-                "indexer",
-                format!("indexer proof ok (leaf_index={})", p.leaf_index),
-            )
-            .await;
-            (
-                p.leaf_index,
-                p.siblings_hex,
-                p.path_bits
-                    .into_iter()
-                    .map(|b| (b & 1) as u32)
-                    .collect::<Vec<u32>>(),
-                p.root_hex,
-            )
-        }
-        Ok(IndexerProofLookup::NotFound(detail)) => {
-            // After swaps, the spent note leaf is replaced, so the commitment genuinely
-            // is no longer in the tree.
-            return Err(AppError::BadRequest(format!(
-                "Commitment not found in tree-indexer (likely spent via swap / leaf replaced, or wrong note). commitment={} indexer={} detail={}",
-                commitment_hex, indexer_url, detail
-            )));
-        }
-        Ok(IndexerProofLookup::Unavailable(detail)) => {
-            return Err(AppError::BadGateway(format!(
-                "tree-indexer unavailable/out-of-sync: indexer={} detail={}",
-                indexer_url, detail
-            )));
-        }
-        Err(e) => {
-            return Err(AppError::BadGateway(format!(
-                "tree-indexer query failed: indexer={} err={}",
-                indexer_url, e
-            )));
-        }
-    };
+    utils::progress(&progress_tx, "proof", "validating client-provided Merkle proof").await;
+
+    let leaf_index = browser_inputs.leaf_index;
+    let merkle_path = browser_inputs.siblings_hex.clone();
+    let path_indices: Vec<u32> = browser_inputs.path_bits.iter().map(|b| (b & 1) as u32).collect();
+    let root_hex = browser_inputs.root_hex.clone();
+
+    // Basic shape validation.
+    if merkle_path.len() != MERKLE_TREE_DEPTH || path_indices.len() != MERKLE_TREE_DEPTH {
+        return Err(AppError::BadRequest(format!(
+            "invalid proof shape (siblings={} path_bits={} expected={})",
+            merkle_path.len(), path_indices.len(), MERKLE_TREE_DEPTH
+        )));
+    }
     let max_leaf_index = 1u32.checked_shl(MERKLE_TREE_DEPTH as u32).unwrap_or(0);
     if leaf_index >= max_leaf_index {
-        return Err(AppError::BadGateway(format!(
-            "tree-indexer returned invalid leaf_index={} for depth={}",
-            leaf_index, MERKLE_TREE_DEPTH
+        return Err(AppError::BadRequest(format!(
+            "invalid leaf_index={} for depth={}", leaf_index, MERKLE_TREE_DEPTH
         )));
     }
     utils::progress(
         &progress_tx,
-        "merkle",
-        format!("commitment found at leaf_index={}", leaf_index),
+        "proof",
+        format!("proof accepted (leaf_index={})", leaf_index),
     )
     .await;
 
@@ -1206,14 +1127,12 @@ async fn relay_circom_inner(
     // 5️⃣  Generate Groth16 proof inside enclave (snarkjs fullprove)
     // -----------------------------------------------------------------
     // Sanity-check the root is actually usable on-chain (tree changelog).
-    let root_bytes: [u8; 32] = hex::decode(&root_hex)
-        .map_err(|_| AppError::Internal("indexer root_hex decode failed".into()))?
-        .try_into()
-        .map_err(|_| AppError::Internal("indexer root must be 32 bytes".into()))?;
+    let root_bytes = parse_hex32_field("root_hex", &root_hex)
+        .map_err(|_| AppError::Internal("root_hex decode failed".into()))?;
     let in_tree = tree_changelog_contains_root(&state.rpc, &current_tree_pubkey, root_bytes)?;
     if !in_tree {
         return Err(AppError::BadGateway(
-            "tree-indexer returned a root that is not in on-chain history".into(),
+            "client-provided root is not in on-chain history".into(),
         ));
     }
 
@@ -1461,13 +1380,8 @@ async fn relay_circom_liquidity_inner(
     // -----------------------------------------------------------------
     // 2️⃣  Decode note preimage inputs (no on-chain nullifier PDA check).
     // -----------------------------------------------------------------
-    let nullifier_bytes = hex::decode(&browser_inputs.nullifier)
+    let nullifier_bytes = parse_hex32_field("nullifier", &browser_inputs.nullifier)
         .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?;
-    if nullifier_bytes.len() != 32 {
-        return Err(AppError::BadRequest(
-            "nullifier must be 32 bytes (hex-encoded)".into(),
-        ));
-    }
 
     // -----------------------------------------------------------------
     // 3️⃣  Compute Merkle proof (tree-indexer required)
@@ -1491,103 +1405,33 @@ async fn relay_circom_liquidity_inner(
 
     let current_tree_pubkey = current_merkle_tree_pubkey(&state.rpc, &state.program_id)?;
 
-    let indexer_url = env::var("INDEXER_URL").map_err(|_| {
-        AppError::BadGateway("INDEXER_URL is required (relayer is indexer-only)".into())
-    })?;
-    let indexer_url = indexer_url.trim().trim_end_matches('/').to_string();
-    if indexer_url.is_empty() {
-        return Err(AppError::BadGateway(
-            "INDEXER_URL is required (relayer is indexer-only)".into(),
-        ));
-    }
-
+    // -----------------------------------------------------------------
+    // Merkle proof: provided by the client (validated on-chain).
+    // -----------------------------------------------------------------
     let commitment_hex = hex::encode(commitment);
-    utils::progress(&progress_tx, "indexer", "querying indexer for root+proof").await;
-    let (leaf_index, merkle_path, path_indices, root_hex) = match fetch_indexer_proof(
-        &indexer_url,
-        &commitment_hex,
-        &state.admin_token,
-    ) {
-        Ok(IndexerProofLookup::Found(p)) => {
-            if p.depth != MERKLE_TREE_DEPTH {
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned wrong depth (expected={} got={}): indexer={}",
-                    MERKLE_TREE_DEPTH, p.depth, indexer_url
-                )));
-            }
-            if p.siblings_hex.len() != MERKLE_TREE_DEPTH || p.path_bits.len() != MERKLE_TREE_DEPTH {
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned invalid proof shape (siblings={} path_bits={} expected={}): indexer={}",
-                    p.siblings_hex.len(),
-                    p.path_bits.len(),
-                    MERKLE_TREE_DEPTH,
-                    indexer_url
-                )));
-            }
-            // Fail fast: leaf returned by indexer must match the commitment we computed.
-            let leaf_bytes = parse_hex32_field("indexer.leaf_hex", &p.leaf_hex)?;
-            if leaf_bytes == [0u8; 32] {
-                metrics::inc_indexer_mismatch_total();
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned empty leaf for commitment={}: indexer={}",
-                    commitment_hex, indexer_url
-                )));
-            }
-            if leaf_bytes != commitment {
-                metrics::inc_indexer_mismatch_total();
-                return Err(AppError::BadGateway(format!(
-                    "tree-indexer returned non-matching leaf (commitment={} leaf_hex={}): indexer={}",
-                    commitment_hex,
-                    p.leaf_hex,
-                    indexer_url
-                )));
-            }
-            utils::progress(
-                &progress_tx,
-                "indexer",
-                format!("indexer proof ok (leaf_index={})", p.leaf_index),
-            )
-            .await;
-            (
-                p.leaf_index,
-                p.siblings_hex,
-                p.path_bits
-                    .into_iter()
-                    .map(|b| (b & 1) as u32)
-                    .collect::<Vec<u32>>(),
-                p.root_hex,
-            )
-        }
-        Ok(IndexerProofLookup::NotFound(detail)) => {
-            return Err(AppError::BadRequest(format!(
-                "Commitment not found in tree-indexer (likely spent via swap / leaf replaced, or wrong note). commitment={} indexer={} detail={}",
-                commitment_hex, indexer_url, detail
-            )));
-        }
-        Ok(IndexerProofLookup::Unavailable(detail)) => {
-            return Err(AppError::BadGateway(format!(
-                "tree-indexer unavailable/out-of-sync: indexer={} detail={}",
-                indexer_url, detail
-            )));
-        }
-        Err(e) => {
-            return Err(AppError::BadGateway(format!(
-                "tree-indexer query failed: indexer={} err={}",
-                indexer_url, e
-            )));
-        }
-    };
+    utils::progress(&progress_tx, "proof", "validating client-provided Merkle proof").await;
+
+    let leaf_index = browser_inputs.leaf_index;
+    let merkle_path = browser_inputs.siblings_hex.clone();
+    let path_indices: Vec<u32> = browser_inputs.path_bits.iter().map(|b| (b & 1) as u32).collect();
+    let root_hex = browser_inputs.root_hex.clone();
+
+    if merkle_path.len() != MERKLE_TREE_DEPTH || path_indices.len() != MERKLE_TREE_DEPTH {
+        return Err(AppError::BadRequest(format!(
+            "invalid proof shape (siblings={} path_bits={} expected={})",
+            merkle_path.len(), path_indices.len(), MERKLE_TREE_DEPTH
+        )));
+    }
     let max_leaf_index = 1u32.checked_shl(MERKLE_TREE_DEPTH as u32).unwrap_or(0);
     if leaf_index >= max_leaf_index {
-        return Err(AppError::BadGateway(format!(
-            "tree-indexer returned invalid leaf_index={} for depth={}",
-            leaf_index, MERKLE_TREE_DEPTH
+        return Err(AppError::BadRequest(format!(
+            "invalid leaf_index={} for depth={}", leaf_index, MERKLE_TREE_DEPTH
         )));
     }
     utils::progress(
         &progress_tx,
-        "merkle",
-        format!("commitment found at leaf_index={}", leaf_index),
+        "proof",
+        format!("proof accepted (leaf_index={})", leaf_index),
     )
     .await;
 
@@ -1617,14 +1461,12 @@ async fn relay_circom_liquidity_inner(
     }
 
     // Sanity-check the root is actually usable on-chain (tree changelog).
-    let root_bytes: [u8; 32] = hex::decode(&root_hex)
-        .map_err(|_| AppError::Internal("indexer root_hex decode failed".into()))?
-        .try_into()
-        .map_err(|_| AppError::Internal("indexer root must be 32 bytes".into()))?;
+    let root_bytes = parse_hex32_field("root_hex", &root_hex)
+        .map_err(|_| AppError::Internal("root_hex decode failed".into()))?;
     let in_tree = tree_changelog_contains_root(&state.rpc, &current_tree_pubkey, root_bytes)?;
     if !in_tree {
         return Err(AppError::BadGateway(
-            "tree-indexer returned a root that is not in on-chain history".into(),
+            "client-provided root is not in on-chain history".into(),
         ));
     }
 
@@ -1825,19 +1667,12 @@ async fn generate_withdraw_groth16(
         )));
     }
 
-    let nullifier_bytes: [u8; 32] = hex::decode(&browser_inputs.nullifier)
-        .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("nullifier must be 32 bytes".into()))?;
-    let secret_bytes: [u8; 32] = hex::decode(&browser_inputs.secret)
-        .map_err(|_| AppError::BadRequest("Invalid hex in secret".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("secret must be 32 bytes".into()))?;
-
-    let root_bytes: [u8; 32] = hex::decode(root_hex)
-        .map_err(|_| AppError::BadRequest("Invalid hex in root".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("root must be 32 bytes".into()))?;
+    let nullifier_bytes = parse_hex32_field("nullifier", &browser_inputs.nullifier)
+        .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?;
+    let secret_bytes = parse_hex32_field("secret", &browser_inputs.secret)
+        .map_err(|_| AppError::BadRequest("Invalid hex in secret".into()))?;
+    let root_bytes = parse_hex32_field("root_hex", root_hex)
+        .map_err(|_| AppError::BadRequest("Invalid hex in root".into()))?;
 
     let recipient_pubkey = Pubkey::from_str(&browser_inputs.recipient)
         .map_err(|e| AppError::BadRequest(format!("Invalid recipient token account: {e}")))?;
@@ -1857,10 +1692,8 @@ async fn generate_withdraw_groth16(
     // so we **do not reverse** it.
     let mut path_elements: Vec<Vec<u8>> = Vec::with_capacity(MERKLE_TREE_DEPTH);
     for s in merkle_path.iter() {
-        let b: [u8; 32] = hex::decode(s)
-            .map_err(|_| AppError::Internal("Invalid hex in merkle_path".into()))?
-            .try_into()
-            .map_err(|_| AppError::Internal("merkle_path element must be 32 bytes".into()))?;
+        let b = parse_hex32_field("merkle_path", s)
+            .map_err(|_| AppError::Internal("Invalid hex in merkle_path".into()))?;
         path_elements.push(b.to_vec());
     }
 
@@ -2201,19 +2034,12 @@ async fn generate_withdraw_liquidity_groth16(
         )));
     }
 
-    let nullifier_bytes: [u8; 32] = hex::decode(&browser_inputs.nullifier)
-        .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("nullifier must be 32 bytes".into()))?;
-    let secret_bytes: [u8; 32] = hex::decode(&browser_inputs.secret)
-        .map_err(|_| AppError::BadRequest("Invalid hex in secret".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("secret must be 32 bytes".into()))?;
-
-    let root_bytes: [u8; 32] = hex::decode(root_hex)
-        .map_err(|_| AppError::BadRequest("Invalid hex in root".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("root must be 32 bytes".into()))?;
+    let nullifier_bytes = parse_hex32_field("nullifier", &browser_inputs.nullifier)
+        .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?;
+    let secret_bytes = parse_hex32_field("secret", &browser_inputs.secret)
+        .map_err(|_| AppError::BadRequest("Invalid hex in secret".into()))?;
+    let root_bytes = parse_hex32_field("root_hex", root_hex)
+        .map_err(|_| AppError::BadRequest("Invalid hex in root".into()))?;
 
     let recipient_bytes: [u8; 32] = recipient_owner.to_bytes();
 
@@ -2225,10 +2051,8 @@ async fn generate_withdraw_liquidity_groth16(
 
     let mut path_elements: Vec<Vec<u8>> = Vec::with_capacity(MERKLE_TREE_DEPTH);
     for s in merkle_path.iter() {
-        let b: [u8; 32] = hex::decode(s)
-            .map_err(|_| AppError::Internal("Invalid hex in merkle_path".into()))?
-            .try_into()
-            .map_err(|_| AppError::Internal("merkle_path element must be 32 bytes".into()))?;
+        let b = parse_hex32_field("merkle_path", s)
+            .map_err(|_| AppError::Internal("Invalid hex in merkle_path".into()))?;
         path_elements.push(b.to_vec());
     }
     let path_indices: Vec<u32> = path_indices.to_vec();

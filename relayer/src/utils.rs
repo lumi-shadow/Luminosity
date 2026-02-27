@@ -1,6 +1,7 @@
+use std::env;
+
 use crate::error::AppError;
 use crate::error::AppResult;
-use crate::types::IndexerProofResponse;
 use crate::types::{ProgressTx, RelayProgressEvent};
 use crate::{SPL_TREE_DATA_OFFSET, SPL_TREE_MAX_BUFFER_SIZE, SPL_TREE_MAX_DEPTH};
 use num_bigint::BigUint;
@@ -8,9 +9,6 @@ use sha3::{Digest, Keccak256};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{hash::hash as solana_sha256, pubkey::Pubkey};
 use spl_concurrent_merkle_tree::concurrent_merkle_tree::ConcurrentMerkleTree;
-use std::env;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use tracing::warn;
 
 // ---------------------------------------------------------------------
@@ -249,247 +247,6 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-pub fn parse_http_base(base: &str) -> Result<(String, u16, String), AppError> {
-    // Minimal parser for URLs like:
-    // - http://127.0.0.1:8787
-    // - http://localhost:8787/prefix
-    //
-    // NOTE: We intentionally do NOT support https here (no TLS deps).
-    let b = base.trim().trim_end_matches('/');
-    let b = b
-        .strip_prefix("http://")
-        .ok_or_else(|| AppError::BadRequest("INDEXER_URL must start with http://".into()))?;
-    let (hostport, prefix) = match b.split_once('/') {
-        Some((hp, p)) => (hp, format!("/{}", p.trim_matches('/'))),
-        None => (b, String::new()),
-    };
-    let (host, port) = match hostport.split_once(':') {
-        Some((h, p)) => {
-            let port: u16 = p
-                .parse()
-                .map_err(|_| AppError::BadRequest("INDEXER_URL port is invalid".into()))?;
-            (h.to_string(), port)
-        }
-        None => (hostport.to_string(), 80),
-    };
-    Ok((host, port, prefix))
-}
-
-fn http_dechunk(body: &[u8]) -> Result<Vec<u8>, AppError> {
-    // Tiny chunked decoder (hyper may use chunked encoding).
-    let mut i = 0usize;
-    let mut out = Vec::new();
-    loop {
-        let line_end = body[i..]
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or_else(|| AppError::Internal("invalid chunked encoding (missing CRLF)".into()))?;
-        let line = &body[i..i + line_end];
-        i += line_end + 2;
-        let line_str = std::str::from_utf8(line)
-            .map_err(|_| AppError::Internal("chunk size not utf8".into()))?;
-        let size_hex = line_str.split(';').next().unwrap_or("");
-        let size = usize::from_str_radix(size_hex.trim(), 16)
-            .map_err(|_| AppError::Internal("invalid chunk size".into()))?;
-        if size == 0 {
-            break;
-        }
-        if i + size > body.len() {
-            return Err(AppError::Internal(
-                "invalid chunked encoding (chunk overruns body)".into(),
-            ));
-        }
-        out.extend_from_slice(&body[i..i + size]);
-        i += size;
-        if body.get(i..i + 2) != Some(b"\r\n") {
-            return Err(AppError::Internal(
-                "invalid chunked encoding (missing chunk CRLF)".into(),
-            ));
-        }
-        i += 2;
-    }
-    Ok(out)
-}
-
-#[derive(Debug)]
-pub enum IndexerProofLookup {
-    Found(IndexerProofResponse),
-    NotFound(String),
-    Unavailable(String),
-}
-
-pub fn fetch_indexer_proof(
-    indexer_url: &str,
-    commitment_hex: &str,
-    admin_token: &str,
-) -> Result<IndexerProofLookup, AppError> {
-    fetch_indexer_proof_inner(indexer_url, commitment_hex, admin_token, true)
-}
-
-fn fetch_indexer_proof_inner(
-    indexer_url: &str,
-    commitment_hex: &str,
-    admin_token: &str,
-    allow_self_heal: bool,
-) -> Result<IndexerProofLookup, AppError> {
-    let (host, port, prefix) = parse_http_base(indexer_url)?;
-    let path = format!("{}/proof/0x{}", prefix, commitment_hex);
-    let addr = format!("{}:{}", host, port);
-
-    let timeout_secs = env::var("INDEXER_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2);
-
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| AppError::BadGateway(format!("indexer connect failed: {e}")))?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
-
-    let admin_token = admin_token.trim();
-    if admin_token.is_empty() {
-        return Err(AppError::Internal("admin token is empty".into()));
-    }
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\nAuthorization: Bearer {}\r\n\r\n",
-        path, host, admin_token
-    );
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|e| AppError::BadGateway(format!("indexer write failed: {e}")))?;
-
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| AppError::BadGateway(format!("indexer read failed: {e}")))?;
-
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| {
-            AppError::BadGateway("indexer response missing header/body separator".into())
-        })?;
-    let (head, body_raw) = buf.split_at(split + 4);
-    let head_str = std::str::from_utf8(head)
-        .map_err(|_| AppError::BadGateway("indexer response headers not utf8".into()))?;
-    let status_line = head_str.lines().next().unwrap_or("");
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| AppError::BadGateway("indexer response missing status code".into()))?;
-
-    let is_chunked = head_str
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked");
-    let body = if is_chunked {
-        http_dechunk(body_raw)?
-    } else {
-        body_raw.to_vec()
-    };
-
-    match status {
-        200 => {
-            let v: IndexerProofResponse = serde_json::from_slice(&body)
-                .map_err(|e| AppError::BadGateway(format!("indexer returned invalid json: {e}")))?;
-            Ok(IndexerProofLookup::Found(v))
-        }
-        403 => {
-            // IP not allowlisted. Try to self-register, then retry once.
-            if !allow_self_heal {
-                return Ok(IndexerProofLookup::Unavailable(format!(
-                    "indexer returned 403 after allowlist self-heal: {}",
-                    indexer_body_snippet(&body)
-                )));
-            }
-            indexer_allowlist_self(indexer_url, admin_token, timeout_secs)?;
-            fetch_indexer_proof_inner(indexer_url, commitment_hex, admin_token, false)
-        }
-        404 => Ok(IndexerProofLookup::NotFound(indexer_body_snippet(&body))),
-        503 => Ok(IndexerProofLookup::Unavailable(indexer_body_snippet(&body))),
-        _ => Ok(IndexerProofLookup::Unavailable(format!(
-            "unexpected status {}: {}",
-            status,
-            indexer_body_snippet(&body)
-        ))),
-    }
-}
-
-fn indexer_allowlist_self(
-    indexer_url: &str,
-    admin_token: &str,
-    timeout_secs: u64,
-) -> Result<(), AppError> {
-    let (host, port, prefix) = parse_http_base(indexer_url)?;
-    let path = format!("{}/admin/allowlist/self", prefix);
-    let addr = format!("{}:{}", host, port);
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|e| AppError::BadGateway(format!("indexer connect failed: {e}")))?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
-
-    let admin_token = admin_token.trim();
-    if admin_token.is_empty() {
-        return Err(AppError::Internal("admin token is empty".into()));
-    }
-    let body = b"{}";
-    let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer {}\r\n\r\n",
-        path,
-        host,
-        body.len(),
-        admin_token
-    );
-    stream
-        .write_all(req.as_bytes())
-        .and_then(|_| stream.write_all(body))
-        .map_err(|e| AppError::BadGateway(format!("indexer write failed: {e}")))?;
-
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|e| AppError::BadGateway(format!("indexer read failed: {e}")))?;
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| {
-            AppError::BadGateway("indexer response missing header/body separator".into())
-        })?;
-    let (head, body_raw) = buf.split_at(split + 4);
-    let head_str = std::str::from_utf8(head)
-        .map_err(|_| AppError::BadGateway("indexer response headers not utf8".into()))?;
-    let status_line = head_str.lines().next().unwrap_or("");
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| AppError::BadGateway("indexer response missing status code".into()))?;
-    let is_chunked = head_str
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked");
-    let body = if is_chunked {
-        http_dechunk(body_raw)?
-    } else {
-        body_raw.to_vec()
-    };
-    if status != 200 {
-        return Err(AppError::BadGateway(format!(
-            "indexer allowlist self failed ({status}): {}",
-            indexer_body_snippet(&body)
-        )));
-    }
-    Ok(())
-}
-
-pub fn indexer_body_snippet(body: &[u8]) -> String {
-    const MAX: usize = 400;
-    let s = String::from_utf8_lossy(body).trim().to_string();
-    if s.len() <= MAX {
-        s
-    } else {
-        format!("{}…", &s[..MAX])
-    }
-}
 
 /// Two-layer asset commitment matching circuits + on-chain program:
 ///   Layer 1: noteHash   = keccak256(nullifier || secret)
@@ -500,9 +257,9 @@ pub fn compute_commitment(
     amount: u64,
     asset_id: u32,
 ) -> Result<[u8; 32], AppError> {
-    let nullifier = hex::decode(nullifier_hex)
+    let nullifier = hex::decode(nullifier_hex.trim().trim_start_matches("0x"))
         .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?;
-    let secret = hex::decode(secret_hex)
+    let secret = hex::decode(secret_hex.trim().trim_start_matches("0x"))
         .map_err(|_| AppError::BadRequest("Invalid hex in secret".into()))?;
 
     if nullifier.len() != 32 || secret.len() != 32 {
@@ -541,9 +298,9 @@ pub fn compute_commitment_liquidity(
     shares: u64,
     pool_id: u32,
 ) -> Result<[u8; 32], AppError> {
-    let nullifier = hex::decode(nullifier_hex)
+    let nullifier = hex::decode(nullifier_hex.trim().trim_start_matches("0x"))
         .map_err(|_| AppError::BadRequest("Invalid hex in nullifier".into()))?;
-    let secret = hex::decode(secret_hex)
+    let secret = hex::decode(secret_hex.trim().trim_start_matches("0x"))
         .map_err(|_| AppError::BadRequest("Invalid hex in secret".into()))?;
     if nullifier.len() != 32 || secret.len() != 32 {
         return Err(AppError::BadRequest(

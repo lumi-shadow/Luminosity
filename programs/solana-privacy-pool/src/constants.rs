@@ -29,4 +29,29 @@ pub const SPL_APPEND_DISCRIMINATOR: [u8; 8] = [0x95, 0x78, 0x12, 0xde, 0xec, 0xe
 pub const SPL_REPLACE_LEAF_DISCRIMINATOR: [u8; 8] =
     [0xcc, 0xa5, 0x4c, 0x64, 0x49, 0x93, 0x00, 0x80];
 
+/// v2 Poseidon commitment tree (in-program, replaces the keccak SPL tree path).
+///
+/// `MERKLE_TREE_HEIGHT` MUST match the depth proven by the new Poseidon circuits
+/// (privacy-cash / Light use 26). `ROOT_HISTORY_SIZE` is the membership-proof
+/// validity window (how many recent roots stay acceptable).
+pub const MERKLE_TREE_HEIGHT: u8 = 26;
+pub const ROOT_HISTORY_SIZE: usize = 100;
+
+/// PDA seed for the v2 Poseidon commitment tree: `[POSEIDON_TREE_SEED, amm]`.
+pub const POSEIDON_TREE_SEED: &[u8] = b"poseidon_tree";
+/// PDA seed for a spent-nullifier marker: `[NULLIFIER_SEED, amm, nullifier]`.
+/// Existence of the PDA == the note is spent (replaces the leaf-index bitmap).
+pub const NULLIFIER_SEED: &[u8] = b"nullifier";
+
+/// Commitment domain tags. `commitment = Poseidon(noteHash, value, id, kind)`.
+/// `kind` is baked per note-family so asset and LP notes can never collide even
+/// when (value, id) coincide. MUST match the `kind` constants in the circuits
+/// (poseidon_commitment.circom).
+pub const KIND_ASSET: u8 = 1;
+pub const KIND_LP: u8 = 2;
+
+/// 8-byte discriminator for the SPL Account Compression `close_empty_tree`
+/// instruction (used by the one-time keccak-tree vacuum/close to reclaim rent).
+pub const SPL_CLOSE_EMPTY_TREE_DISCRIMINATOR: [u8; 8] = [50, 14, 219, 107, 78, 103, 16, 103];
+
 // NOTE: Avoid keeping unused constants in the on-chain crate; add back when needed.

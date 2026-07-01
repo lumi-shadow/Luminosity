@@ -2,10 +2,10 @@
 //!
 //! One global concurrent Merkle tree stores note commitments.
 //! - Deposits append commitments to the tree.
-//! - Swaps tombstone the input leaf and append a fresh output leaf.
+//! - Swaps (private) tombstone the input leaf and append a fresh output leaf.
 //! - Withdrawals verify Groth16 proofs and pay out from shared AMM vaults.
 //!
-//! Canonical two-layer commitment format (V2):
+//! Canonical two-layer commitment format:
 //!   Layer 1 – noteHash  = keccak256(nullifier ‖ secret)
 //!   Layer 2 – commitment = keccak256(noteHash ‖ amountLE8 ‖ assetIdLE4)
 //!             (or sharesLE8 ‖ poolIdLE4 for LP notes)
@@ -15,13 +15,13 @@ use anchor_spl::token::{self, Transfer as TokenTransfer};
 use bincode::Options;
 use groth16_solana::groth16::Groth16Verifier;
 use solana_program::bpf_loader_upgradeable::{self, UpgradeableLoaderState};
-use spl_concurrent_merkle_tree::concurrent_merkle_tree::ConcurrentMerkleTree;
 
 // --- Modules ---
 mod constants;
 mod contexts;
 mod errors;
 mod pmm;
+mod poseidon_merkle_tree;
 mod state;
 mod types;
 mod utils;
@@ -44,182 +44,10 @@ use verifying_key_deposit_liquidity_bind::VERIFYINGKEY_DEPOSIT_LIQUIDITY_BIND;
 use verifying_key_liquidity::VERIFYINGKEY_LIQUIDITY;
 use verifying_key_swap::VERIFYINGKEY_SWAP;
 
+// v2 Poseidon shielded path.
+use light_hasher::{Hasher, Poseidon};
+
 declare_id!("p1VaCyyfzodMni1tSYhvUFd3MyGB6sb6NRFWPixXD54");
-
-// =============================================================================
-//  Helpers (private, used only by instruction handlers)
-// =============================================================================
-
-/// Big-endian 32-byte field element from a byte slice.
-fn to_field_element(slice: &[u8]) -> [u8; 32] {
-    let mut elem = [0u8; 32];
-    elem[32 - slice.len()..].copy_from_slice(slice);
-    elem
-}
-
-/// Validate a Merkle root against the SPL tree changelog buffer.
-fn require_valid_root(merkle_tree: &AccountInfo, root: &[u8; 32]) -> Result<()> {
-    let data = merkle_tree.try_borrow_data()?;
-    let tree_end = SPL_TREE_DATA_OFFSET
-        + std::mem::size_of::<ConcurrentMerkleTree<SPL_TREE_MAX_DEPTH, SPL_TREE_MAX_BUFFER_SIZE>>();
-    if data.len() < tree_end {
-        return err!(PrivacyError::TreeDeserializationFailed);
-    }
-    let tree = bytemuck::try_from_bytes::<
-        ConcurrentMerkleTree<SPL_TREE_MAX_DEPTH, SPL_TREE_MAX_BUFFER_SIZE>,
-    >(&data[SPL_TREE_DATA_OFFSET..tree_end])
-    .map_err(|_| PrivacyError::TreeDeserializationFailed)?;
-
-    require!(
-        tree.change_logs.iter().any(|e| e.root == *root),
-        PrivacyError::InvalidMerkleRoot
-    );
-    Ok(())
-}
-
-/// Read the latest output leaf index after an append, and increment `total_deposits`.
-fn post_append_update(
-    merkle_tree: &AccountInfo,
-    amm: &mut Amm,
-) -> Result<u64> {
-    let leaf_index = amm.total_deposits;
-    amm.total_deposits = amm
-        .total_deposits
-        .checked_add(1)
-        .ok_or(PrivacyError::MathOverflow)?;
-    // Read the new root to keep the SPL tree changelog consistent; the root is not
-    // persisted separately—root acceptance relies on the SPL tree changelog itself.
-    let _new_root = {
-        let data = merkle_tree.try_borrow_data()?;
-        let tree_end = SPL_TREE_DATA_OFFSET
-            + std::mem::size_of::<
-                ConcurrentMerkleTree<SPL_TREE_MAX_DEPTH, SPL_TREE_MAX_BUFFER_SIZE>,
-            >();
-        if data.len() < tree_end {
-            return err!(PrivacyError::TreeDeserializationFailed);
-        }
-        let tree = bytemuck::try_from_bytes::<
-            ConcurrentMerkleTree<SPL_TREE_MAX_DEPTH, SPL_TREE_MAX_BUFFER_SIZE>,
-        >(&data[SPL_TREE_DATA_OFFSET..tree_end])
-        .map_err(|_| PrivacyError::TreeDeserializationFailed)?;
-        let seq = tree.active_index;
-        let idx = if seq > 0 { (seq - 1) as usize % 64 } else { 63 };
-        tree.change_logs[idx].root
-    };
-    Ok(leaf_index)
-}
-
-/// Build + invoke the SPL Compression `Append` CPI.
-fn cpi_spl_append<'a>(
-    compression_program: &AccountInfo<'a>,
-    merkle_tree: &AccountInfo<'a>,
-    authority: &AccountInfo<'a>,
-    noop: &AccountInfo<'a>,
-    commitment: &[u8; 32],
-    signer_seeds: &[&[&[u8]]],
-) -> Result<()> {
-    let mut data = SPL_APPEND_DISCRIMINATOR.to_vec();
-    data.extend_from_slice(commitment);
-    let ix = solana_program::instruction::Instruction {
-        program_id: compression_program.key(),
-        accounts: vec![
-            solana_program::instruction::AccountMeta::new(merkle_tree.key(), false),
-            solana_program::instruction::AccountMeta::new_readonly(authority.key(), true),
-            solana_program::instruction::AccountMeta::new_readonly(noop.key(), false),
-        ],
-        data,
-    };
-    solana_program::program::invoke_signed(
-        &ix,
-        &[
-            compression_program.clone(),
-            merkle_tree.clone(),
-            authority.clone(),
-            noop.clone(),
-        ],
-        signer_seeds,
-    )?;
-    Ok(())
-}
-
-/// Build + invoke the SPL Compression `replace_leaf` CPI (tombstone).
-fn cpi_spl_replace_leaf<'a>(
-    compression_program: &AccountInfo<'a>,
-    merkle_tree: &AccountInfo<'a>,
-    authority: &AccountInfo<'a>,
-    noop: &AccountInfo<'a>,
-    root: &[u8; 32],
-    previous_leaf: &[u8; 32],
-    index: u32,
-    proof_accounts: &[AccountInfo<'a>],
-    all_infos: &[AccountInfo<'a>],
-    signer_seeds: &[&[&[u8]]],
-) -> Result<()> {
-    let mut data = Vec::with_capacity(8 + 32 + 32 + 32 + 4);
-    data.extend_from_slice(&SPL_REPLACE_LEAF_DISCRIMINATOR);
-    data.extend_from_slice(root);
-    data.extend_from_slice(previous_leaf);
-    data.extend_from_slice(&[0u8; 32]); // tombstone leaf
-    data.extend_from_slice(&index.to_le_bytes());
-
-    let mut metas = vec![
-        solana_program::instruction::AccountMeta::new(merkle_tree.key(), false),
-        solana_program::instruction::AccountMeta::new_readonly(authority.key(), true),
-        solana_program::instruction::AccountMeta::new_readonly(noop.key(), false),
-    ];
-    for acc in proof_accounts {
-        metas.push(solana_program::instruction::AccountMeta::new_readonly(
-            acc.key(),
-            false,
-        ));
-    }
-
-    let ix = solana_program::instruction::Instruction {
-        program_id: compression_program.key(),
-        accounts: metas,
-        data,
-    };
-    solana_program::program::invoke_signed(&ix, all_infos, signer_seeds)?;
-    Ok(())
-}
-
-/// Validate + mark a leaf as spent in the bitmap shard. Returns (byte_index, mask).
-fn validate_and_mark_spent(
-    shard: &mut SpentBitmapShard,
-    leaf_index: u32,
-) -> Result<()> {
-    require_leaf_index_in_range(leaf_index)?;
-    let shard_index: u32 = leaf_index / SPENT_BITMAP_SHARD_BITS;
-    let max_shard = max_spent_shard_index_u32()?;
-    require!(shard_index <= max_shard, PrivacyError::ShardIndexOutOfRange);
-
-    let bit_in_shard = leaf_index % SPENT_BITMAP_SHARD_BITS;
-    let byte_i = (bit_in_shard / 8) as usize;
-    let mask = 1u8 << (bit_in_shard % 8);
-    require!(byte_i < SPENT_BITMAP_SHARD_BYTES, PrivacyError::MathOverflow);
-    require!((shard.bits[byte_i] & mask) == 0, PrivacyError::AlreadySpent);
-    shard.bits[byte_i] |= mask;
-    Ok(())
-}
-
-/// Same as above but only checks (does NOT set the bit). For two-phase patterns where
-/// the CPI must succeed before marking spent.
-fn validate_not_spent(
-    shard: &SpentBitmapShard,
-    leaf_index: u32,
-) -> Result<(usize, u8)> {
-    require_leaf_index_in_range(leaf_index)?;
-    let shard_index: u32 = leaf_index / SPENT_BITMAP_SHARD_BITS;
-    let max_shard = max_spent_shard_index_u32()?;
-    require!(shard_index <= max_shard, PrivacyError::ShardIndexOutOfRange);
-
-    let bit_in_shard = leaf_index % SPENT_BITMAP_SHARD_BITS;
-    let byte_i = (bit_in_shard / 8) as usize;
-    let mask = 1u8 << (bit_in_shard % 8);
-    require!(byte_i < SPENT_BITMAP_SHARD_BYTES, PrivacyError::MathOverflow);
-    require!((shard.bits[byte_i] & mask) == 0, PrivacyError::AlreadySpent);
-    Ok((byte_i, mask))
-}
 
 // =============================================================================
 //  Program
@@ -295,6 +123,81 @@ pub mod solana_privacy_pool {
         Ok(())
     }
 
+    /// Initialize the v2 Poseidon commitment tree (call once; admin-gated).
+    ///
+    /// Validates the tree config up front (audit findings #2/#3): `height` must
+    /// index into the hasher's zero-bytes table and stay below the 64-bit shift
+    /// limit, and the root-history size must fit the ring buffer — so a
+    /// misconfigured deploy is impossible. Then seeds the empty tree.
+    pub fn init_poseidon_tree(ctx: Context<InitPoseidonTree>) -> Result<()> {
+        let mut tree = ctx.accounts.merkle_tree.load_init()?;
+
+        // Bound checks before touching the tree (prevents the panics the audit
+        // flagged on a bad `height` / `root_history_size`).
+        let zero_len = <Poseidon as Hasher>::zero_bytes().len();
+        require!(
+            (MERKLE_TREE_HEIGHT as usize) < zero_len,
+            PrivacyError::InvalidTreeConfig
+        );
+        require!(MERKLE_TREE_HEIGHT < 64, PrivacyError::InvalidTreeConfig);
+        require!(
+            (1..=tree.root_history.len()).contains(&ROOT_HISTORY_SIZE),
+            PrivacyError::InvalidTreeConfig
+        );
+
+        tree.height = MERKLE_TREE_HEIGHT;
+        tree.root_history_size = ROOT_HISTORY_SIZE as u8;
+        tree.authority = ctx.accounts.amm.key();
+        tree.bump = ctx.bumps.merkle_tree;
+
+        crate::poseidon_merkle_tree::MerkleTree::initialize::<Poseidon>(&mut tree)?;
+        Ok(())
+    }
+
+    /// Admin: zero one leaf of the legacy keccak SPL tree. Call once per
+    /// non-empty leaf (Merkle proof nodes in `remaining_accounts`) before
+    /// `admin_close_keccak_tree`. Reuses SPL `replace_leaf` (writes a zero leaf).
+    pub fn admin_vacuum_keccak_leaf<'info>(
+        ctx: Context<'_, '_, '_, 'info, AdminVacuumKeccakLeaf<'info>>,
+        root: [u8; 32],
+        previous_leaf: [u8; 32],
+        index: u32,
+    ) -> Result<()> {
+        let bump = ctx.bumps.amm;
+        let seeds: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
+        let mut all_infos = ctx.accounts.to_account_infos();
+        all_infos.extend_from_slice(ctx.remaining_accounts);
+        cpi_spl_replace_leaf(
+            &ctx.accounts.compression_program.to_account_info(),
+            &ctx.accounts.merkle_tree.to_account_info(),
+            &ctx.accounts.amm.to_account_info(),
+            &ctx.accounts.noop.to_account_info(),
+            &root,
+            &previous_leaf,
+            index,
+            ctx.remaining_accounts,
+            &all_infos,
+            seeds,
+        )?;
+        Ok(())
+    }
+
+    /// Admin: close the (already-zeroed) legacy keccak SPL tree, reclaiming its
+    /// rent lamports to `rent_recipient`. Signed by the AMM PDA.
+    pub fn admin_close_keccak_tree(ctx: Context<AdminCloseKeccakTree>) -> Result<()> {
+        let bump = ctx.bumps.amm;
+        let seeds: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
+        cpi_spl_close_empty_tree(
+            &ctx.accounts.compression_program.to_account_info(),
+            &ctx.accounts.merkle_tree.to_account_info(),
+            &ctx.accounts.amm.to_account_info(),
+            &ctx.accounts.rent_recipient.to_account_info(),
+            seeds,
+        )?;
+        msg!("Legacy keccak tree closed; rent -> {}", ctx.accounts.rent_recipient.key());
+        Ok(())
+    }
+
     /// Toggle the global emergency pause flag.
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
         ctx.accounts.amm.paused = paused;
@@ -311,11 +214,107 @@ pub mod solana_privacy_pool {
         Ok(())
     }
 
-    /// Rotate the TEE / relayer authority key.
-    pub fn rotate_tee_authority(ctx: Context<RotateTeeAuthority>, new_tee_authority: Pubkey) -> Result<()> {
-        require!(new_tee_authority != Pubkey::default(), PrivacyError::InvalidTEEAuthority);
-        ctx.accounts.amm.tee_authority = new_tee_authority;
-        msg!("TEE authority rotated to {}", new_tee_authority);
+    /// Rotate the TEE authority with full borrow cleanup for one pool.
+    ///
+    /// 1. Recall all borrowed tokens from old TEE ATAs → vault (AMM PDA delegate)
+    /// 2. Zero the borrow ledger, restore pool reserves
+    /// 3. Set `amm.tee_authority` to the new TEE
+    /// 4. Approve `u64::MAX` delegate on new TEE ATAs
+    ///
+    /// Old TEE does NOT need to sign — the AMM PDA delegate handles recall.
+    pub fn rotate_tee_with_borrow_cleanup(ctx: Context<RotateTeeWithBorrowCleanup>) -> Result<()> {
+        let new_tee = ctx.accounts.new_tee_authority.key();
+        require!(new_tee != Pubkey::default(), PrivacyError::InvalidTEEAuthority);
+        require!(new_tee != ctx.accounts.amm.tee_authority, PrivacyError::InvalidTEEAuthority);
+
+        let borrowed_a = ctx.accounts.borrow_ledger.borrowed_a;
+        let borrowed_b = ctx.accounts.borrow_ledger.borrowed_b;
+
+        let bump = ctx.bumps.amm;
+        let signer: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
+
+        // 1) Recall principal from old TEE ATAs → vault.
+        // If old TEE is insolvent, recall what is available and rotate anyway.
+        let available_a = ctx.accounts.old_tee_ata_a.amount;
+        let available_b = ctx.accounts.old_tee_ata_b.amount;
+        let recalled_a = core::cmp::min(borrowed_a, available_a);
+        let recalled_b = core::cmp::min(borrowed_b, available_b);
+        let bad_debt_a = borrowed_a.saturating_sub(recalled_a);
+        let bad_debt_b = borrowed_b.saturating_sub(recalled_b);
+
+        if recalled_a > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    TokenTransfer {
+                        from: ctx.accounts.old_tee_ata_a.to_account_info(),
+                        to: ctx.accounts.vault_a.to_account_info(),
+                        authority: ctx.accounts.amm.to_account_info(),
+                    },
+                    signer,
+                ),
+                recalled_a,
+            ).map_err(|_| PrivacyError::RecallFailed)?;
+        }
+        if recalled_b > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    TokenTransfer {
+                        from: ctx.accounts.old_tee_ata_b.to_account_info(),
+                        to: ctx.accounts.vault_b.to_account_info(),
+                        authority: ctx.accounts.amm.to_account_info(),
+                    },
+                    signer,
+                ),
+                recalled_b,
+            ).map_err(|_| PrivacyError::RecallFailed)?;
+        }
+
+        // 2) Zero ledger, restore reserves.
+        ctx.accounts.pool.reserve_a = ctx.accounts.pool
+            .reserve_a
+            .saturating_add(recalled_a);
+        ctx.accounts.pool.reserve_b = ctx.accounts.pool
+            .reserve_b
+            .saturating_add(recalled_b);
+
+        ctx.accounts.borrow_ledger.borrowed_a = 0;
+        ctx.accounts.borrow_ledger.borrowed_b = 0;
+
+        // 3) Rotate authority.
+        ctx.accounts.amm.tee_authority = new_tee;
+
+        // 4) Grant delegate on new TEE ATAs.
+        token::approve(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Approve {
+                    to: ctx.accounts.new_tee_ata_a.to_account_info(),
+                    delegate: ctx.accounts.amm.to_account_info(),
+                    authority: ctx.accounts.new_tee_authority.to_account_info(),
+                },
+            ),
+            u64::MAX,
+        )?;
+        token::approve(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Approve {
+                    to: ctx.accounts.new_tee_ata_b.to_account_info(),
+                    delegate: ctx.accounts.amm.to_account_info(),
+                    authority: ctx.accounts.new_tee_authority.to_account_info(),
+                },
+            ),
+            u64::MAX,
+        )?;
+
+        msg!(
+            "TEE rotated to {} with borrow cleanup (bad_debt a={}, b={})",
+            new_tee,
+            bad_debt_a,
+            bad_debt_b
+        );
         Ok(())
     }
 
@@ -328,6 +327,7 @@ pub mod solana_privacy_pool {
     /// Admin-only. Initializes the `Pool` PDA, shared AMM vault ATAs, and
     /// registers the mints + pool in the global `Registry`.
     pub fn create_pool(ctx: Context<CreatePool>) -> Result<()> {
+        require_not_paused(&ctx.accounts.amm)?;
         let mint_a = ctx.accounts.mint_a.key();
         let mint_b = ctx.accounts.mint_b.key();
         let pool_key = ctx.accounts.pool.key();
@@ -373,7 +373,7 @@ pub mod solana_privacy_pool {
         pool.reserve_a = 0;
         pool.reserve_b = 0;
         pool.bump = ctx.bumps.pool;
-        // V2 fields — defaults; configure via `configure_pool`.
+        // Oracle / PMM fields — defaults; configure via `configure_pool`.
         pool.oracle_a = Pubkey::default();
         pool.oracle_b = Pubkey::default();
         pool.dec_a = ctx.accounts.mint_a.decimals;
@@ -385,7 +385,7 @@ pub mod solana_privacy_pool {
         Ok(())
     }
 
-    /// Configure pool V2 fields (oracle feeds, fee, PMM policy). Admin-only.
+    /// Configure pool oracle feeds, fee, and PMM policy. Admin-only.
     ///
     /// Must be called before `execute_zk_swap` can succeed for this pool.
     pub fn configure_pool(
@@ -438,19 +438,13 @@ pub mod solana_privacy_pool {
         encrypted_note: Vec<u8>,
     ) -> Result<()> {
         require_not_paused(&ctx.accounts.amm)?;
-        let max_leaves = max_tree_leaves_u64()?;
-        require!(ctx.accounts.amm.total_deposits < max_leaves, PrivacyError::TreeFull);
         require!(encrypted_note.len() <= 512, PrivacyError::NoteTooLong);
         require!(amount > 0, PrivacyError::ZeroDepositAmount);
         require!(commitment != [0u8; 32], PrivacyError::InvalidCommitment);
         require!(ctx.accounts.registry.is_initialized, PrivacyError::RegistryNotInitialized);
-        require!(
-            ctx.accounts.merkle_tree.owner == &contexts::SplCompression::id(),
-            PrivacyError::InvalidTreeOwner
-        );
         require!(ctx.accounts.user_source.amount >= amount, PrivacyError::InsufficientUserBalance);
 
-        // 0) Verify Groth16 proof — binds (commitment, amount, asset_id).
+        // 0) Verify Groth16 proof — binds (amount, asset_id, commitment).
         let asset_id = registry_asset_id_for_mint(&ctx.accounts.registry, ctx.accounts.mint.key())
             .ok_or(PrivacyError::AssetNotRegistered)?;
 
@@ -459,16 +453,12 @@ pub mod solana_privacy_pool {
         let mut asset_be = [0u8; 32];
         asset_be[28..].copy_from_slice(&asset_id.to_be_bytes());
 
-        let public_inputs: [[u8; 32]; 4] = [
-            to_field_element(&commitment[0..16]),
-            to_field_element(&commitment[16..32]),
-            amount_be,
-            asset_be,
-        ];
+        // Public inputs match deposit_poseidon.circom: [amount, assetId, commitment].
+        let public_inputs: [[u8; 32]; 3] = [amount_be, asset_be, commitment];
         if VERIFYINGKEY_DEPOSIT_ASSET_BIND.vk_ic.len() != public_inputs.len() + 1 {
             return err!(PrivacyError::InvalidVerifyingKey);
         }
-        let mut verifier = Groth16Verifier::<4>::new(
+        let mut verifier = Groth16Verifier::<3>::new(
             &proof.a, &proof.b, &proof.c, &public_inputs, &VERIFYINGKEY_DEPOSIT_ASSET_BIND,
         ).map_err(|_| PrivacyError::InvalidProof)?;
         verifier.verify().map_err(|_| PrivacyError::InvalidProof)?;
@@ -486,23 +476,14 @@ pub mod solana_privacy_pool {
             amount,
         )?;
 
-        // 2) Append commitment to the tree.
-        let bump = ctx.bumps.amm;
-        let seeds: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
-        cpi_spl_append(
-            &ctx.accounts.compression_program.to_account_info(),
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &ctx.accounts.amm.to_account_info(),
-            &ctx.accounts.noop.to_account_info(),
-            &commitment,
-            seeds,
-        )?;
-
-        // 3) Update deposit counter.
-        let leaf_index = post_append_update(
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &mut ctx.accounts.amm,
-        )?;
+        // 2) Append commitment to the Poseidon tree (leaf_index = next_index).
+        let leaf_index = poseidon_append(&ctx.accounts.merkle_tree, &commitment)?;
+        ctx.accounts.amm.total_deposits = ctx
+            .accounts
+            .amm
+            .total_deposits
+            .checked_add(1)
+            .ok_or(PrivacyError::MathOverflow)?;
 
         emit!(DepositEvent { commitment, leaf_index, amount_a: amount, amount_b: 0, encrypted_note });
         Ok(())
@@ -527,6 +508,12 @@ pub mod solana_privacy_pool {
         let reserve_a_before = ctx.accounts.pool.reserve_a;
         let reserve_b_before = ctx.accounts.pool.reserve_b;
         let total_before = ctx.accounts.pool.total_shares;
+        let effective_a = (reserve_a_before as u128)
+            .checked_add(ctx.accounts.borrow_ledger.borrowed_a as u128)
+            .ok_or(PrivacyError::MathOverflow)?;
+        let effective_b = (reserve_b_before as u128)
+            .checked_add(ctx.accounts.borrow_ledger.borrowed_b as u128)
+            .ok_or(PrivacyError::MathOverflow)?;
 
         // 0) Verify Groth16 proof — binds (commitment, shares, pool_id).
         let pool_id = registry_pool_id_for_pool(&ctx.accounts.registry, ctx.accounts.pool.key())
@@ -537,16 +524,12 @@ pub mod solana_privacy_pool {
         let mut pool_be = [0u8; 32];
         pool_be[28..].copy_from_slice(&pool_id.to_be_bytes());
 
-        let public_inputs: [[u8; 32]; 4] = [
-            to_field_element(&commitment[0..16]),
-            to_field_element(&commitment[16..32]),
-            shares_be,
-            pool_be,
-        ];
+        // Public inputs match deposit_liquidity_poseidon.circom: [shares, poolId, commitment].
+        let public_inputs: [[u8; 32]; 3] = [shares_be, pool_be, commitment];
         if VERIFYINGKEY_DEPOSIT_LIQUIDITY_BIND.vk_ic.len() != public_inputs.len() + 1 {
             return err!(PrivacyError::InvalidVerifyingKey);
         }
-        let mut verifier = Groth16Verifier::<4>::new(
+        let mut verifier = Groth16Verifier::<3>::new(
             &proof.a, &proof.b, &proof.c, &public_inputs, &VERIFYINGKEY_DEPOSIT_LIQUIDITY_BIND,
         ).map_err(|_| PrivacyError::InvalidProof)?;
         verifier.verify().map_err(|_| PrivacyError::InvalidProof)?;
@@ -573,23 +556,14 @@ pub mod solana_privacy_pool {
             )?;
         }
 
-        // 2) Append LP note to the tree.
-        let bump = ctx.bumps.amm;
-        let seeds: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
-        cpi_spl_append(
-            &ctx.accounts.compression_program.to_account_info(),
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &ctx.accounts.amm.to_account_info(),
-            &ctx.accounts.noop.to_account_info(),
-            &commitment,
-            seeds,
-        )?;
-
-        // 3) Update deposit counter.
-        let leaf_index = post_append_update(
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &mut ctx.accounts.amm,
-        )?;
+        // 2) Append LP note to the Poseidon tree (leaf_index = next_index).
+        let leaf_index = poseidon_append(&ctx.accounts.merkle_tree, &commitment)?;
+        ctx.accounts.amm.total_deposits = ctx
+            .accounts
+            .amm
+            .total_deposits
+            .checked_add(1)
+            .ok_or(PrivacyError::MathOverflow)?;
 
         // 4) Mint shares.
         let pool = &mut ctx.accounts.pool;
@@ -601,11 +575,11 @@ pub mod solana_privacy_pool {
             require!(root <= (u64::MAX as u128), PrivacyError::MathOverflow);
             root as u64
         } else {
-            require!(reserve_a_before > 0 && reserve_b_before > 0, PrivacyError::InvalidReserves);
+            require!(effective_a > 0 && effective_b > 0, PrivacyError::InvalidReserves);
 
             // Enforce correct ratio (±1 rounding tolerance).
-            let ra = reserve_a_before as u128;
-            let rb = reserve_b_before as u128;
+            let ra = effective_a;
+            let rb = effective_b;
             let aa = amount_a as u128;
             let ab = amount_b as u128;
             let ideal_b_floor = aa.checked_mul(rb).ok_or(PrivacyError::MathOverflow)? / ra;
@@ -617,10 +591,10 @@ pub mod solana_privacy_pool {
 
             let share_a = (amount_a as u128)
                 .checked_mul(total_before as u128).ok_or(PrivacyError::MathOverflow)?
-                / (reserve_a_before as u128);
+                / effective_a;
             let share_b = (amount_b as u128)
                 .checked_mul(total_before as u128).ok_or(PrivacyError::MathOverflow)?
-                / (reserve_b_before as u128);
+                / effective_b;
             let m = core::cmp::min(share_a, share_b);
             require!(m <= (u64::MAX as u128), PrivacyError::MathOverflow);
             m as u64
@@ -654,10 +628,10 @@ pub mod solana_privacy_pool {
         let asset_id = registry_asset_id_for_mint(&ctx.accounts.registry, ctx.accounts.mint_output.key())
             .ok_or(PrivacyError::AssetNotRegistered)?;
 
-        // 1) Validate Merkle root.
-        require_valid_root(&ctx.accounts.merkle_tree.to_account_info(), &root)?;
+        // 1) Validate Merkle root against the Poseidon tree's root history.
+        require_poseidon_root(&ctx.accounts.merkle_tree, &root)?;
 
-        // 2) Verify Groth16 proof (8 public inputs).
+        // 2) Verify Groth16 proof (7 public inputs).
         let rec_bytes = ctx.accounts.recipient.key().to_bytes();
         let mut fee_be = [0u8; 32];
         fee_be[24..].copy_from_slice(&relayer_fee.to_be_bytes());
@@ -668,9 +642,10 @@ pub mod solana_privacy_pool {
         let mut leaf_be = [0u8; 32];
         leaf_be[28..].copy_from_slice(&leaf_index.to_be_bytes());
 
-        let public_inputs: [[u8; 32]; 8] = [
-            to_field_element(&root[0..16]),
-            to_field_element(&root[16..32]),
+        // Public inputs match withdraw_poseidon.circom:
+        // [root, recipientHi, recipientLo, relayerFee, amount, assetId, leafIndex].
+        let public_inputs: [[u8; 32]; 7] = [
+            root,
             to_field_element(&rec_bytes[0..16]),
             to_field_element(&rec_bytes[16..32]),
             fee_be,
@@ -681,7 +656,7 @@ pub mod solana_privacy_pool {
         if VERIFYINGKEY.vk_ic.len() != public_inputs.len() + 1 {
             return err!(PrivacyError::InvalidVerifyingKey);
         }
-        let mut verifier = Groth16Verifier::<8>::new(
+        let mut verifier = Groth16Verifier::<7>::new(
             &proof.a, &proof.b, &proof.c, &public_inputs, &VERIFYINGKEY,
         ).map_err(|_| PrivacyError::InvalidProof)?;
         verifier.verify().map_err(|_| PrivacyError::InvalidProof)?;
@@ -720,6 +695,10 @@ pub mod solana_privacy_pool {
     }
 
     /// Withdraw liquidity – private LP note -> public tokens (both mints).
+    ///
+    /// `borrow_ledger` is always required to prevent omission-based underpayment.
+    /// `tee_ata_a` / `tee_ata_b` are still optional and only required when the
+    /// computed recall from TEE is non-zero.
     pub fn withdraw_liquidity(
         ctx: Context<WithdrawLiquidity>,
         proof: Groth16Proof,
@@ -740,10 +719,10 @@ pub mod solana_privacy_pool {
         require!(ctx.accounts.recipient_account_a.mint == ctx.accounts.mint_a.key(), PrivacyError::InvalidRecipientMint);
         require!(ctx.accounts.recipient_account_b.mint == ctx.accounts.mint_b.key(), PrivacyError::InvalidRecipientMint);
 
-        // 1) Validate Merkle root.
-        require_valid_root(&ctx.accounts.merkle_tree.to_account_info(), &root)?;
+        // 1) Validate Merkle root against the Poseidon tree's root history.
+        require_poseidon_root(&ctx.accounts.merkle_tree, &root)?;
 
-        // 2) Verify Groth16 proof (8 public inputs).
+        // 2) Verify Groth16 proof (7 public inputs).
         let rec_bytes = recipient_owner.to_bytes();
         let mut fee_be = [0u8; 32];
         fee_be[24..].copy_from_slice(&relayer_fee.to_be_bytes());
@@ -754,9 +733,10 @@ pub mod solana_privacy_pool {
         let mut leaf_be = [0u8; 32];
         leaf_be[28..].copy_from_slice(&leaf_index.to_be_bytes());
 
-        let public_inputs: [[u8; 32]; 8] = [
-            to_field_element(&root[0..16]),
-            to_field_element(&root[16..32]),
+        // Public inputs match withdraw_liquidity_poseidon.circom:
+        // [root, recipientHi, recipientLo, relayerFee, shares, poolId, leafIndex].
+        let public_inputs: [[u8; 32]; 7] = [
+            root,
             to_field_element(&rec_bytes[0..16]),
             to_field_element(&rec_bytes[16..32]),
             fee_be,
@@ -767,7 +747,7 @@ pub mod solana_privacy_pool {
         if VERIFYINGKEY_LIQUIDITY.vk_ic.len() != public_inputs.len() + 1 {
             return err!(PrivacyError::InvalidVerifyingKey);
         }
-        let mut verifier = Groth16Verifier::<8>::new(
+        let mut verifier = Groth16Verifier::<7>::new(
             &proof.a, &proof.b, &proof.c, &public_inputs, &VERIFYINGKEY_LIQUIDITY,
         ).map_err(|_| PrivacyError::InvalidProof)?;
         verifier.verify().map_err(|_| PrivacyError::InvalidProof)?;
@@ -775,7 +755,7 @@ pub mod solana_privacy_pool {
         // 3) Nullify (mark spent).
         validate_and_mark_spent(&mut ctx.accounts.spent_shard, leaf_index)?;
 
-        // 4) Compute payout from shares + virtual reserves.
+        // 4) Compute payout from shares + effective reserves.
         let total_shares = ctx.accounts.pool.total_shares;
         require!(total_shares > 0, PrivacyError::ZeroTotalShares);
         require!(shares > 0, PrivacyError::ZeroShares);
@@ -789,42 +769,85 @@ pub mod solana_privacy_pool {
             PrivacyError::InsufficientPoolBalance
         );
 
-        let amount_a: u64 = u64::try_from(
-            (shares as u128).checked_mul(reserve_a as u128).ok_or(PrivacyError::MathOverflow)? / (total_shares as u128),
+        let borrowed_a = ctx.accounts.borrow_ledger.borrowed_a;
+        let borrowed_b = ctx.accounts.borrow_ledger.borrowed_b;
+
+        let ts = total_shares as u128;
+
+        let from_vault_a: u64 = u64::try_from(
+            (shares as u128).checked_mul(reserve_a as u128).ok_or(PrivacyError::MathOverflow)? / ts,
         ).map_err(|_| PrivacyError::MathOverflow)?;
-        let amount_b: u64 = u64::try_from(
-            (shares as u128).checked_mul(reserve_b as u128).ok_or(PrivacyError::MathOverflow)? / (total_shares as u128),
+        let from_vault_b: u64 = u64::try_from(
+            (shares as u128).checked_mul(reserve_b as u128).ok_or(PrivacyError::MathOverflow)? / ts,
         ).map_err(|_| PrivacyError::MathOverflow)?;
 
-        // 5) Transfer out.
+        let from_tee_a: u64 = u64::try_from(
+            (shares as u128).checked_mul(borrowed_a as u128).ok_or(PrivacyError::MathOverflow)? / ts,
+        ).map_err(|_| PrivacyError::MathOverflow)?;
+        let from_tee_b: u64 = u64::try_from(
+            (shares as u128).checked_mul(borrowed_b as u128).ok_or(PrivacyError::MathOverflow)? / ts,
+        ).map_err(|_| PrivacyError::MathOverflow)?;
+
+        // 5) Transfer from vault (AMM PDA signs).
         let bump = ctx.bumps.amm;
         let signer: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
 
-        if amount_a > 0 {
+        if from_vault_a > 0 {
             token::transfer(
                 CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), TokenTransfer {
                     from: ctx.accounts.amm_vault_a.to_account_info(),
                     to: ctx.accounts.recipient_account_a.to_account_info(),
                     authority: ctx.accounts.amm.to_account_info(),
                 }, signer),
-                amount_a,
+                from_vault_a,
             )?;
         }
-        if amount_b > 0 {
+        if from_vault_b > 0 {
             token::transfer(
                 CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), TokenTransfer {
                     from: ctx.accounts.amm_vault_b.to_account_info(),
                     to: ctx.accounts.recipient_account_b.to_account_info(),
                     authority: ctx.accounts.amm.to_account_info(),
                 }, signer),
-                amount_b,
+                from_vault_b,
             )?;
         }
 
-        // 6) Burn shares + update reserves.
+        // 6) Recall from TEE via max delegate (AMM PDA signs as delegate).
+        if from_tee_a > 0 || from_tee_b > 0 {
+            let tee_ata_a = ctx.accounts.tee_ata_a.as_ref().ok_or(PrivacyError::RecallFailed)?;
+            let tee_ata_b = ctx.accounts.tee_ata_b.as_ref().ok_or(PrivacyError::RecallFailed)?;
+
+            if from_tee_a > 0 {
+                token::transfer(
+                    CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), TokenTransfer {
+                        from: tee_ata_a.to_account_info(),
+                        to: ctx.accounts.recipient_account_a.to_account_info(),
+                        authority: ctx.accounts.amm.to_account_info(),
+                    }, signer),
+                    from_tee_a,
+                ).map_err(|_| PrivacyError::RecallFailed)?;
+            }
+            if from_tee_b > 0 {
+                token::transfer(
+                    CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), TokenTransfer {
+                        from: tee_ata_b.to_account_info(),
+                        to: ctx.accounts.recipient_account_b.to_account_info(),
+                        authority: ctx.accounts.amm.to_account_info(),
+                    }, signer),
+                    from_tee_b,
+                ).map_err(|_| PrivacyError::RecallFailed)?;
+            }
+        }
+
+        // 7) Burn shares + update reserves + borrowed.
+        let ledger = &mut ctx.accounts.borrow_ledger;
+        ledger.borrowed_a = ledger.borrowed_a.checked_sub(from_tee_a).ok_or(PrivacyError::MathOverflow)?;
+        ledger.borrowed_b = ledger.borrowed_b.checked_sub(from_tee_b).ok_or(PrivacyError::MathOverflow)?;
+
         let pool = &mut ctx.accounts.pool;
-        pool.reserve_a = pool.reserve_a.checked_sub(amount_a).ok_or(PrivacyError::MathOverflow)?;
-        pool.reserve_b = pool.reserve_b.checked_sub(amount_b).ok_or(PrivacyError::MathOverflow)?;
+        pool.reserve_a = pool.reserve_a.checked_sub(from_vault_a).ok_or(PrivacyError::MathOverflow)?;
+        pool.reserve_b = pool.reserve_b.checked_sub(from_vault_b).ok_or(PrivacyError::MathOverflow)?;
         pool.total_shares = pool.total_shares.checked_sub(shares).ok_or(PrivacyError::SharesExceedTotal)?;
 
         msg!("LP withdrawal ok");
@@ -843,47 +866,18 @@ pub mod solana_privacy_pool {
     ) -> Result<()> {
         require_not_paused(&ctx.accounts.config)?;
         require!(encrypted_note.len() <= 512, PrivacyError::NoteTooLong);
-        require!(
-            ctx.remaining_accounts.len() <= SPL_TREE_MAX_DEPTH,
-            PrivacyError::TooManyMerkleProofAccounts
-        );
-
-        // Validate leaf not already spent (don't mark yet — wait for CPI success).
+        // Validate leaf not already spent (don't mark yet — wait until append).
         let (byte_i, mask) = validate_not_spent(&ctx.accounts.spent_shard, swap.index)?;
 
-        // Validate Merkle root.
-        require_valid_root(&ctx.accounts.merkle_tree.to_account_info(), &swap.root)?;
+        // Validate the referenced root is known. TEE-trusted path: no membership
+        // proof, and the input leaf is not tombstoned — the spent bitmap is the
+        // double-spend guard.
+        require_poseidon_root(&ctx.accounts.merkle_tree, &swap.root)?;
 
-        // 1) Tombstone the input leaf.
-        let bump = ctx.bumps.config;
-        let seeds: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
-        let mut all_infos = ctx.accounts.to_account_infos();
-        all_infos.extend_from_slice(ctx.remaining_accounts);
+        // 1) Append the TEE-provided output leaf to the Poseidon tree.
+        let output_leaf_index = poseidon_append(&ctx.accounts.merkle_tree, &swap.new_leaf)?;
 
-        cpi_spl_replace_leaf(
-            &ctx.accounts.compression_program.to_account_info(),
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.noop.to_account_info(),
-            &swap.root,
-            &swap.previous_leaf,
-            swap.index,
-            ctx.remaining_accounts,
-            &all_infos,
-            seeds,
-        )?;
-
-        // 2) Append the output leaf.
-        cpi_spl_append(
-            &ctx.accounts.compression_program.to_account_info(),
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.noop.to_account_info(),
-            &swap.new_leaf,
-            seeds,
-        )?;
-
-        // 3) Mark spent (only after both CPIs succeeded).
+        // 2) Mark input leaf spent.
         ctx.accounts.spent_shard.bits[byte_i] |= mask;
 
         // 4) Update pool reserves using checked deltas (not blind overwrite).
@@ -924,11 +918,13 @@ pub mod solana_privacy_pool {
             PrivacyError::InsufficientPoolBalance
         );
 
-        // 5) Update deposit counter.
-        let output_leaf_index = post_append_update(
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &mut ctx.accounts.config,
-        )?;
+        // 5) Update deposit counter (leaf index captured at append above).
+        ctx.accounts.config.total_deposits = ctx
+            .accounts
+            .config
+            .total_deposits
+            .checked_add(1)
+            .ok_or(PrivacyError::MathOverflow)?;
 
         emit!(SwapAppendEvent {
             pool: ctx.accounts.pool.key(),
@@ -936,8 +932,6 @@ pub mod solana_privacy_pool {
             input_leaf_index: swap.index,
             output_commitment: swap.new_leaf,
             output_leaf_index,
-            new_reserve_a: swap.new_reserve_a,
-            new_reserve_b: swap.new_reserve_b,
             encrypted_note,
         });
         msg!("Swap ok");
@@ -998,10 +992,12 @@ pub mod solana_privacy_pool {
         // --- Validate leaf not spent ---
         let (byte_i, mask) = validate_not_spent(&ctx.accounts.spent_shard, params.input_leaf_index)?;
 
-        // --- Validate Merkle root ---
-        require_valid_root(&ctx.accounts.merkle_tree.to_account_info(), &params.root)?;
+        // --- Validate Merkle root against the Poseidon tree's root history ---
+        require_poseidon_root(&ctx.accounts.merkle_tree, &params.root)?;
 
-        // --- Verify Groth16 proof (swap_zk circuit, 8 public inputs) ---
+        // --- Verify Groth16 proof (swap_poseidon circuit, 7 public inputs).
+        //     Membership is now proven IN-CIRCUIT (root + leafIndex are public),
+        //     so the input commitment is recomputed inside the proof, not passed. ---
         let mut amount_in_be = [0u8; 32];
         amount_in_be[24..].copy_from_slice(&amount_in.to_be_bytes());
         let mut asset_in_be = [0u8; 32];
@@ -1010,21 +1006,24 @@ pub mod solana_privacy_pool {
         asset_out_be[28..].copy_from_slice(&asset_id_out.to_be_bytes());
         let mut min_out_be = [0u8; 32];
         min_out_be[24..].copy_from_slice(&min_amount_out.to_be_bytes());
+        let mut leaf_be = [0u8; 32];
+        leaf_be[28..].copy_from_slice(&params.input_leaf_index.to_be_bytes());
 
-        let public_inputs: [[u8; 32]; 8] = [
-            to_field_element(&params.input_commitment[0..16]),
-            to_field_element(&params.input_commitment[16..32]),
+        // Public inputs match swap_poseidon.circom:
+        // [root, amountIn, assetIdIn, leafIndex, noteHashOut, assetIdOut, minAmountOut].
+        let public_inputs: [[u8; 32]; 7] = [
+            params.root,
             amount_in_be,
             asset_in_be,
-            to_field_element(&params.note_hash_out[0..16]),
-            to_field_element(&params.note_hash_out[16..32]),
+            leaf_be,
+            params.note_hash_out,
             asset_out_be,
             min_out_be,
         ];
         if VERIFYINGKEY_SWAP.vk_ic.len() != public_inputs.len() + 1 {
             return err!(PrivacyError::InvalidVerifyingKey);
         }
-        let mut verifier = Groth16Verifier::<8>::new(
+        let mut verifier = Groth16Verifier::<7>::new(
             &proof.a, &proof.b, &proof.c, &public_inputs, &VERIFYINGKEY_SWAP,
         ).map_err(|_| PrivacyError::InvalidProof)?;
         verifier.verify().map_err(|_| PrivacyError::InvalidProof)?;
@@ -1059,43 +1058,16 @@ pub mod solana_privacy_pool {
         require!(amount_out >= min_amount_out, PrivacyError::SlippageExceeded);
         require!(amount_out > 0, PrivacyError::ZeroSwapOutput);
 
-        // --- Compute output commitment (Layer 2) on-chain ---
-        let mut preimage = [0u8; 44];
-        preimage[0..32].copy_from_slice(&params.note_hash_out);
-        preimage[32..40].copy_from_slice(&amount_out.to_le_bytes());
-        preimage[40..44].copy_from_slice(&asset_id_out.to_le_bytes());
-        let output_commitment = solana_program::keccak::hashv(&[&preimage]).0;
+        // --- Compute output commitment on-chain. MUST match swap_poseidon's
+        //     Commitment: Poseidon(noteHashOut, amountOut, assetIdOut, KIND_ASSET) ---
+        let output_commitment =
+            poseidon_commitment(&params.note_hash_out, amount_out, asset_id_out, KIND_ASSET)?;
 
-        // --- 1) Tombstone the input leaf ---
-        let bump = ctx.bumps.config;
-        let seeds: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
-        let mut all_infos = ctx.accounts.to_account_infos();
-        all_infos.extend_from_slice(ctx.remaining_accounts);
+        // --- 1) Append the output leaf to the Poseidon tree. The input leaf is
+        //     NOT tombstoned; the spent bitmap is the double-spend guard. ---
+        let output_leaf_index = poseidon_append(&ctx.accounts.merkle_tree, &output_commitment)?;
 
-        cpi_spl_replace_leaf(
-            &ctx.accounts.compression_program.to_account_info(),
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.noop.to_account_info(),
-            &params.root,
-            &params.input_commitment,
-            params.input_leaf_index,
-            ctx.remaining_accounts,
-            &all_infos,
-            seeds,
-        )?;
-
-        // --- 2) Append the output leaf ---
-        cpi_spl_append(
-            &ctx.accounts.compression_program.to_account_info(),
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &ctx.accounts.config.to_account_info(),
-            &ctx.accounts.noop.to_account_info(),
-            &output_commitment,
-            seeds,
-        )?;
-
-        // --- 3) Mark input leaf as spent ---
+        // --- 2) Mark input leaf as spent ---
         ctx.accounts.spent_shard.bits[byte_i] |= mask;
 
         // --- 4) Update pool reserves ---
@@ -1113,11 +1085,13 @@ pub mod solana_privacy_pool {
             PrivacyError::InsufficientPoolBalance
         );
 
-        // --- 5) Update deposit counter ---
-        let output_leaf_index = post_append_update(
-            &ctx.accounts.merkle_tree.to_account_info(),
-            &mut ctx.accounts.config,
-        )?;
+        // --- 5) Update deposit counter (leaf index captured at append above) ---
+        ctx.accounts.config.total_deposits = ctx
+            .accounts
+            .config
+            .total_deposits
+            .checked_add(1)
+            .ok_or(PrivacyError::MathOverflow)?;
 
         emit!(ZkSwapEvent {
             pool: ctx.accounts.pool.key(),
@@ -1127,8 +1101,6 @@ pub mod solana_privacy_pool {
             output_leaf_index,
             amount_in, amount_out,
             asset_id_in, asset_id_out,
-            new_reserve_a: ctx.accounts.pool.reserve_a,
-            new_reserve_b: ctx.accounts.pool.reserve_b,
             encrypted_note: params.encrypted_note,
         });
 
@@ -1137,89 +1109,740 @@ pub mod solana_privacy_pool {
     }
 
     // =========================================================================
-    //  Migration
+    //  Borrow / Repay (TEE liquidity borrowing)
     // =========================================================================
 
-    /// Migrate a V1 Pool account to V2 (adds oracle / PMM fields). Admin-only.
+    /// Initialize a per-pool borrow ledger. Admin-only.
     ///
-    /// Safe to call repeatedly (idempotent).
-    pub fn migrate_pool_v2(ctx: Context<MigratePoolV2>) -> Result<()> {
-        let pool_info = &ctx.accounts.pool;
-        let current_len = pool_info.data_len();
-        let target_len = Pool::LEN;
+    /// `max_borrow_bps` sets the borrow cap (hard-capped at 8 000 = 80%).
+    pub fn init_borrow_ledger(ctx: Context<InitBorrowLedger>, max_borrow_bps: u16) -> Result<()> {
+        require!(
+            max_borrow_bps <= BorrowLedger::MAX_BPS,
+            PrivacyError::BorrowCapExceeded
+        );
 
-        if current_len >= target_len {
-            msg!("Pool already at V2 size ({} bytes), skipping", current_len);
-            return Ok(());
+        let ledger = &mut ctx.accounts.borrow_ledger;
+        ledger.pool = ctx.accounts.pool.key();
+        ledger.borrowed_a = 0;
+        ledger.borrowed_b = 0;
+        ledger.max_borrow_bps = max_borrow_bps;
+        ledger.bump = ctx.bumps.borrow_ledger;
+
+        msg!("Borrow ledger initialized: pool={}, max_bps={}", ledger.pool, max_borrow_bps);
+        Ok(())
+    }
+
+    /// Borrow tokens from pool vaults into the TEE wallet.
+    ///
+    /// On first borrow sets the program (AMM PDA) as `u64::MAX` delegate
+    /// on both TEE ATAs so the program can always recall tokens for LP
+    /// withdrawals.
+    pub fn borrow_from_pool(ctx: Context<Borrow>, amount_a: u64, amount_b: u64) -> Result<()> {
+        require_not_paused(&ctx.accounts.amm)?;
+        require!(amount_a > 0 || amount_b > 0, PrivacyError::NoOpBorrowRepay);
+
+        let pool = &ctx.accounts.pool;
+        let ledger = &ctx.accounts.borrow_ledger;
+        let max_bps = ledger.max_borrow_bps as u128;
+
+        if amount_a > 0 {
+            let effective = (pool.reserve_a as u128)
+                .checked_add(ledger.borrowed_a as u128)
+                .ok_or(PrivacyError::MathOverflow)?;
+            let new_borrowed = (ledger.borrowed_a as u128)
+                .checked_add(amount_a as u128)
+                .ok_or(PrivacyError::MathOverflow)?;
+            require!(
+                new_borrowed <= effective.checked_mul(max_bps).ok_or(PrivacyError::MathOverflow)? / 10_000,
+                PrivacyError::BorrowCapExceeded
+            );
+        }
+        if amount_b > 0 {
+            let effective = (pool.reserve_b as u128)
+                .checked_add(ledger.borrowed_b as u128)
+                .ok_or(PrivacyError::MathOverflow)?;
+            let new_borrowed = (ledger.borrowed_b as u128)
+                .checked_add(amount_b as u128)
+                .ok_or(PrivacyError::MathOverflow)?;
+            require!(
+                new_borrowed <= effective.checked_mul(max_bps).ok_or(PrivacyError::MathOverflow)? / 10_000,
+                PrivacyError::BorrowCapExceeded
+            );
         }
 
-        // Validate discriminator + AMM key + mint keys manually (V1-sized account).
-        {
-            let data = pool_info.try_borrow_data()?;
-            let expected_disc = <Pool as anchor_lang::Discriminator>::DISCRIMINATOR;
-            require!(&data[..8] == expected_disc, PrivacyError::InvalidPoolAmm);
+        let first_borrow = ledger.borrowed_a == 0 && ledger.borrowed_b == 0;
 
-            let amm_bytes: [u8; 32] = data[8..40].try_into().map_err(|_| PrivacyError::MathOverflow)?;
-            require!(Pubkey::from(amm_bytes) == ctx.accounts.amm.key(), PrivacyError::InvalidPoolAmm);
+        let bump = ctx.bumps.amm;
+        let signer: &[&[&[u8]]] = &[&[b"amm".as_ref(), &[bump]]];
 
-            // SECURITY: validate that the caller-supplied mints match the pool's stored mints.
-            let mint_a_bytes: [u8; 32] = data[40..72].try_into().map_err(|_| PrivacyError::MathOverflow)?;
-            let mint_b_bytes: [u8; 32] = data[72..104].try_into().map_err(|_| PrivacyError::MathOverflow)?;
-            require!(
-                Pubkey::from(mint_a_bytes) == ctx.accounts.mint_a.key(),
-                PrivacyError::InvalidPoolMints
-            );
-            require!(
-                Pubkey::from(mint_b_bytes) == ctx.accounts.mint_b.key(),
-                PrivacyError::InvalidPoolMints
-            );
-        }
-
-        // Top up rent for the larger account.
-        let rent = Rent::get()?;
-        let new_min = rent.minimum_balance(target_len);
-        let current_lamports = pool_info.lamports();
-        if current_lamports < new_min {
-            let delta = new_min.saturating_sub(current_lamports);
-            anchor_lang::system_program::transfer(
-                CpiContext::new(
-                    ctx.accounts.system_program.to_account_info(),
-                    anchor_lang::system_program::Transfer {
-                        from: ctx.accounts.admin.to_account_info(),
-                        to: pool_info.to_account_info(),
+        if amount_a > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    TokenTransfer {
+                        from: ctx.accounts.vault_a.to_account_info(),
+                        to: ctx.accounts.tee_ata_a.to_account_info(),
+                        authority: ctx.accounts.amm.to_account_info(),
                     },
+                    signer,
                 ),
-                delta,
+                amount_a,
+            )?;
+        }
+        if amount_b > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    TokenTransfer {
+                        from: ctx.accounts.vault_b.to_account_info(),
+                        to: ctx.accounts.tee_ata_b.to_account_info(),
+                        authority: ctx.accounts.amm.to_account_info(),
+                    },
+                    signer,
+                ),
+                amount_b,
             )?;
         }
 
-        pool_info.resize(target_len)?;
-
-        // Write V2 default fields into the newly allocated tail.
-        {
-            let mut data = pool_info.try_borrow_mut_data()?;
-            let defaults = PmmConfig::default();
-            let zero_pk = [0u8; 32];
-
-            let mut off = current_len;
-            data[off..off + 32].copy_from_slice(&zero_pk); off += 32;     // oracle_a
-            data[off..off + 32].copy_from_slice(&zero_pk); off += 32;     // oracle_b
-            data[off] = ctx.accounts.mint_a.decimals;       off += 1;     // dec_a
-            data[off] = ctx.accounts.mint_b.decimals;       off += 1;     // dec_b
-            data[off..off + 2].copy_from_slice(&0u16.to_le_bytes()); off += 2; // fee_bps
-            // PmmConfig (9 × u16 = 18 bytes, borsh LE)
-            data[off..off + 2].copy_from_slice(&defaults.size_spread_mult_bps.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.conf_spread_mult_bps.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.stale_spread_bps_per_sec.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.max_spread_bps.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&(defaults.skew_k_bps as u16).to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.max_skew_bps.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.skew_small_div_bps.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.cpmm_cap_min_size_bps.to_le_bytes()); off += 2;
-            data[off..off + 2].copy_from_slice(&defaults.max_oracle_age_secs.to_le_bytes());
+        if first_borrow {
+            token::approve(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    token::Approve {
+                        to: ctx.accounts.tee_ata_a.to_account_info(),
+                        delegate: ctx.accounts.amm.to_account_info(),
+                        authority: ctx.accounts.tee_authority.to_account_info(),
+                    },
+                ),
+                u64::MAX,
+            )?;
+            token::approve(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    token::Approve {
+                        to: ctx.accounts.tee_ata_b.to_account_info(),
+                        delegate: ctx.accounts.amm.to_account_info(),
+                        authority: ctx.accounts.tee_authority.to_account_info(),
+                    },
+                ),
+                u64::MAX,
+            )?;
         }
 
-        msg!("Pool migrated from V1 ({} bytes) to V2 ({} bytes)", current_len, target_len);
+        let pool = &mut ctx.accounts.pool;
+        pool.reserve_a = pool.reserve_a.checked_sub(amount_a).ok_or(PrivacyError::MathOverflow)?;
+        pool.reserve_b = pool.reserve_b.checked_sub(amount_b).ok_or(PrivacyError::MathOverflow)?;
+
+        let ledger = &mut ctx.accounts.borrow_ledger;
+        ledger.borrowed_a = ledger.borrowed_a.checked_add(amount_a).ok_or(PrivacyError::MathOverflow)?;
+        ledger.borrowed_b = ledger.borrowed_b.checked_add(amount_b).ok_or(PrivacyError::MathOverflow)?;
+
+        ctx.accounts.vault_a.reload()?;
+        ctx.accounts.vault_b.reload()?;
+        require!(
+            pool.reserve_a <= ctx.accounts.vault_a.amount
+                && pool.reserve_b <= ctx.accounts.vault_b.amount,
+            PrivacyError::InsufficientPoolBalance
+        );
+
+        msg!("borrow ok");
         Ok(())
+    }
+
+    /// Repay borrowed tokens from TEE wallet back to pool vaults.
+    ///
+    /// Principal-only: `amount_x <= ledger.borrowed_x`. TEE keeps profits.
+    pub fn repay_to_pool(ctx: Context<Repay>, amount_a: u64, amount_b: u64) -> Result<()> {
+        require!(amount_a > 0 || amount_b > 0, PrivacyError::NoOpBorrowRepay);
+
+        let ledger = &ctx.accounts.borrow_ledger;
+        require!(amount_a <= ledger.borrowed_a, PrivacyError::NothingToRepay);
+        require!(amount_b <= ledger.borrowed_b, PrivacyError::NothingToRepay);
+
+        if amount_a > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    TokenTransfer {
+                        from: ctx.accounts.tee_ata_a.to_account_info(),
+                        to: ctx.accounts.vault_a.to_account_info(),
+                        authority: ctx.accounts.tee_authority.to_account_info(),
+                    },
+                ),
+                amount_a,
+            )?;
+        }
+        if amount_b > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    TokenTransfer {
+                        from: ctx.accounts.tee_ata_b.to_account_info(),
+                        to: ctx.accounts.vault_b.to_account_info(),
+                        authority: ctx.accounts.tee_authority.to_account_info(),
+                    },
+                ),
+                amount_b,
+            )?;
+        }
+
+        let pool = &mut ctx.accounts.pool;
+        pool.reserve_a = pool.reserve_a.checked_add(amount_a).ok_or(PrivacyError::MathOverflow)?;
+        pool.reserve_b = pool.reserve_b.checked_add(amount_b).ok_or(PrivacyError::MathOverflow)?;
+
+        let ledger = &mut ctx.accounts.borrow_ledger;
+        ledger.borrowed_a = ledger.borrowed_a.checked_sub(amount_a).ok_or(PrivacyError::MathOverflow)?;
+        ledger.borrowed_b = ledger.borrowed_b.checked_sub(amount_b).ok_or(PrivacyError::MathOverflow)?;
+
+        msg!("repay ok");
+        Ok(())
+    }
+
+
+    /// Update max borrow cap on a borrow ledger. Admin-only.
+    ///
+    /// Allows governance to keep borrow disabled (`0`) at deploy time and
+    /// enable later without redeploy.
+    pub fn set_max_borrow_bps(ctx: Context<SetMaxBorrowBps>, new_max_borrow_bps: u16) -> Result<()> {
+        require!(
+            new_max_borrow_bps <= BorrowLedger::MAX_BPS,
+            PrivacyError::BorrowCapExceeded
+        );
+
+        ctx.accounts.borrow_ledger.max_borrow_bps = new_max_borrow_bps;
+
+        msg!("Max borrow cap updated to {} bps", new_max_borrow_bps);
+        Ok(())
+    }
+
+}
+
+// =============================================================================
+//  Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    // -- Helpers replicating on-chain math for isolated testing ----------------
+
+    /// Mirrors the withdrawal split math from `withdraw_liquidity`.
+    fn compute_withdrawal(
+        shares: u64,
+        total_shares: u64,
+        reserve_a: u64,
+        reserve_b: u64,
+        borrowed_a: u64,
+        borrowed_b: u64,
+    ) -> (u64, u64, u64, u64) {
+        let ts = total_shares as u128;
+        let from_vault_a = ((shares as u128) * (reserve_a as u128) / ts) as u64;
+        let from_vault_b = ((shares as u128) * (reserve_b as u128) / ts) as u64;
+        let from_tee_a = ((shares as u128) * (borrowed_a as u128) / ts) as u64;
+        let from_tee_b = ((shares as u128) * (borrowed_b as u128) / ts) as u64;
+        (from_vault_a, from_vault_b, from_tee_a, from_tee_b)
+    }
+
+    /// Mirrors the borrow cap check from `borrow_from_pool`.
+    fn borrow_allowed(
+        reserve: u64,
+        already_borrowed: u64,
+        new_amount: u64,
+        max_borrow_bps: u16,
+    ) -> bool {
+        let effective = (reserve as u128) + (already_borrowed as u128);
+        let new_borrowed = (already_borrowed as u128) + (new_amount as u128);
+        new_borrowed <= effective * (max_borrow_bps as u128) / 10_000
+    }
+
+    // -- Withdrawal math tests ------------------------------------------------
+
+    #[test]
+    fn withdraw_no_borrows() {
+        let (fv_a, fv_b, ft_a, ft_b) =
+            compute_withdrawal(100, 1_000, 5_000_000, 10_000_000, 0, 0);
+        assert_eq!(fv_a, 500_000);
+        assert_eq!(fv_b, 1_000_000);
+        assert_eq!(ft_a, 0);
+        assert_eq!(ft_b, 0);
+    }
+
+    #[test]
+    fn withdraw_full_shares_no_borrows() {
+        let (fv_a, fv_b, ft_a, ft_b) =
+            compute_withdrawal(1_000, 1_000, 5_000_000, 10_000_000, 0, 0);
+        assert_eq!(fv_a, 5_000_000);
+        assert_eq!(fv_b, 10_000_000);
+        assert_eq!(ft_a, 0);
+        assert_eq!(ft_b, 0);
+    }
+
+    #[test]
+    fn withdraw_with_50pct_borrow() {
+        // reserve=500, borrowed=500 → effective=1000 per side.
+        // 50% of shares → 250 from vault, 250 from TEE.
+        let (fv_a, fv_b, ft_a, ft_b) =
+            compute_withdrawal(500, 1_000, 500, 500, 500, 500);
+        assert_eq!(fv_a, 250);
+        assert_eq!(fv_b, 250);
+        assert_eq!(ft_a, 250);
+        assert_eq!(ft_b, 250);
+        assert_eq!(fv_a + ft_a, 500); // total payout = effective * shares / total
+        assert_eq!(fv_b + ft_b, 500);
+    }
+
+    #[test]
+    fn withdraw_full_shares_with_borrows() {
+        let (fv_a, fv_b, ft_a, ft_b) =
+            compute_withdrawal(1_000, 1_000, 3_000, 7_000, 2_000, 3_000);
+        assert_eq!(fv_a, 3_000);
+        assert_eq!(fv_b, 7_000);
+        assert_eq!(ft_a, 2_000);
+        assert_eq!(ft_b, 3_000);
+    }
+
+    #[test]
+    fn withdraw_single_sided_borrow() {
+        // Only side A has borrows.
+        let (fv_a, fv_b, ft_a, ft_b) =
+            compute_withdrawal(100, 1_000, 8_000, 10_000, 2_000, 0);
+        assert_eq!(fv_a, 800);
+        assert_eq!(fv_b, 1_000);
+        assert_eq!(ft_a, 200);
+        assert_eq!(ft_b, 0);
+        // Total payout on A = 800 + 200 = 1000 = 10% of effective(10_000).
+        assert_eq!(fv_a + ft_a, 1_000);
+    }
+
+    #[test]
+    fn withdraw_rounding_floors_to_zero() {
+        // 1 share out of 3 with reserve=1: 1*1/3 = 0 (floor).
+        let (fv_a, _, ft_a, _) = compute_withdrawal(1, 3, 1, 0, 1, 0);
+        assert_eq!(fv_a, 0);
+        assert_eq!(ft_a, 0);
+    }
+
+    #[test]
+    fn withdraw_rounding_odd_division() {
+        // 1 share out of 3 with reserve=10: 10/3 = 3 (floor).
+        let (fv_a, _, ft_a, _) = compute_withdrawal(1, 3, 10, 0, 5, 0);
+        assert_eq!(fv_a, 3);
+        assert_eq!(ft_a, 1);
+    }
+
+    #[test]
+    fn withdraw_rounding_always_floors() {
+        // 333 shares out of 1000 with reserve=1000: 333*1000/1000 = 333.
+        // borrowed=999: 333*999/1000 = 332 (floor).
+        let (fv_a, _, ft_a, _) = compute_withdrawal(333, 1_000, 1_000, 0, 999, 0);
+        assert_eq!(fv_a, 333);
+        assert_eq!(ft_a, 332);
+    }
+
+    #[test]
+    fn withdraw_dust_amounts() {
+        let (fv_a, fv_b, ft_a, ft_b) = compute_withdrawal(1, 1_000_000, 1, 1, 1, 1);
+        assert_eq!(fv_a, 0);
+        assert_eq!(fv_b, 0);
+        assert_eq!(ft_a, 0);
+        assert_eq!(ft_b, 0);
+    }
+
+    #[test]
+    fn withdraw_large_reserves_no_overflow() {
+        let max = u64::MAX / 2;
+        let (fv_a, _, ft_a, _) = compute_withdrawal(1, 2, max, 0, max, 0);
+        // 1 * max / 2 = max/2 (u128 intermediate avoids overflow).
+        assert_eq!(fv_a, max / 2);
+        assert_eq!(ft_a, max / 2);
+    }
+
+    #[test]
+    fn withdraw_max_u64_shares_and_reserves() {
+        // shares = total_shares = 1 (single LP), reserves at near-max.
+        let r = u64::MAX - 1;
+        let b = 1u64;
+        let (fv_a, _, ft_a, _) = compute_withdrawal(1, 1, r, 0, b, 0);
+        assert_eq!(fv_a, r);
+        assert_eq!(ft_a, b);
+    }
+
+    #[test]
+    fn withdraw_lp_value_preserved_across_borrow() {
+        // Before borrow: reserve=1000, borrowed=0, shares=100.
+        // LP value per share = 1000/100 = 10.
+        // After borrow 400: reserve=600, borrowed=400, shares=100.
+        // LP effective per share = (600+400)/100 = 10. Same.
+        let (fv_a, _, ft_a, _) = compute_withdrawal(10, 100, 600, 0, 400, 0);
+        assert_eq!(fv_a + ft_a, 100); // 10 shares × 10 value = 100
+    }
+
+    #[test]
+    fn withdraw_multiple_lps_fair_split() {
+        // Two LPs with 500 shares each, total=1000.
+        // reserve=3000, borrowed=2000.
+        let (fv1, _, ft1, _) = compute_withdrawal(500, 1_000, 3_000, 0, 2_000, 0);
+        let (fv2, _, ft2, _) = compute_withdrawal(500, 1_000, 3_000, 0, 2_000, 0);
+        assert_eq!(fv1, fv2);
+        assert_eq!(ft1, ft2);
+        assert_eq!(fv1 + ft1, 2_500); // 50% of effective 5000
+    }
+
+    #[test]
+    fn withdraw_sequential_preserves_proportions() {
+        // LP1 withdraws 200/1000, then LP2 withdraws 200/800 of remaining.
+        let total = 1_000u64;
+        let reserve = 6_000u64;
+        let borrowed = 4_000u64;
+
+        // LP1 withdraws.
+        let (fv1, _, ft1, _) = compute_withdrawal(200, total, reserve, 0, borrowed, 0);
+        assert_eq!(fv1, 1_200);
+        assert_eq!(ft1, 800);
+
+        // State after LP1.
+        let total2 = total - 200;
+        let reserve2 = reserve - fv1;
+        let borrowed2 = borrowed - ft1;
+
+        // LP2 withdraws same shares from updated state.
+        let (fv2, _, ft2, _) = compute_withdrawal(200, total2, reserve2, 0, borrowed2, 0);
+        // Effective per share unchanged: (4800+3200)/800 = 10.
+        assert_eq!(fv2 + ft2, 2_000); // 200/800 * 8000 = 2000
+    }
+
+    // -- Borrow cap tests -----------------------------------------------------
+
+    #[test]
+    fn borrow_cap_at_zero() {
+        assert!(!borrow_allowed(1_000, 0, 1, 0));
+    }
+
+    #[test]
+    fn borrow_cap_50pct_exact_limit() {
+        // effective=1000, cap=50%. Max borrowed = 500.
+        assert!(borrow_allowed(1_000, 0, 500, 5_000));
+        assert!(!borrow_allowed(1_000, 0, 501, 5_000));
+    }
+
+    #[test]
+    fn borrow_cap_50pct_incremental() {
+        // Already borrowed 200, reserve=800, effective=1000.
+        // Cap = 500. Can borrow 300 more.
+        assert!(borrow_allowed(800, 200, 300, 5_000));
+        assert!(!borrow_allowed(800, 200, 301, 5_000));
+    }
+
+    #[test]
+    fn borrow_cap_effective_grows_with_borrows() {
+        // At 50% cap: borrowed <= effective * 0.5.
+        // reserve=500, borrowed=500 → effective=1000, cap=500. Exactly at limit.
+        assert!(borrow_allowed(500, 500, 0, 5_000));
+        assert!(!borrow_allowed(500, 500, 1, 5_000));
+    }
+
+    #[test]
+    fn borrow_cap_low_bps() {
+        // 10% cap (1000 bps). effective=1000. Max borrowed = 100.
+        assert!(borrow_allowed(1_000, 0, 100, 1_000));
+        assert!(!borrow_allowed(1_000, 0, 101, 1_000));
+    }
+
+    #[test]
+    fn borrow_cap_large_reserves() {
+        let reserve = 1_000_000_000_000u64; // 1T
+        assert!(borrow_allowed(reserve, 0, reserve / 2, 5_000));
+        assert!(!borrow_allowed(reserve, 0, reserve / 2 + 1, 5_000));
+    }
+
+    // -- Repay validation tests -----------------------------------------------
+
+    #[test]
+    fn repay_exact_balance() {
+        let borrowed = 500u64;
+        let repay = 500u64;
+        assert!(repay <= borrowed);
+    }
+
+    #[test]
+    fn repay_partial() {
+        let borrowed = 500u64;
+        let repay = 200u64;
+        assert!(repay <= borrowed);
+        assert_eq!(borrowed - repay, 300);
+    }
+
+    #[test]
+    fn repay_exceeds_borrowed() {
+        let borrowed = 500u64;
+        let repay = 501u64;
+        assert!(repay > borrowed);
+    }
+
+    // -- State update invariants ----------------------------------------------
+
+    #[test]
+    fn state_after_borrow() {
+        let reserve = 10_000u64;
+        let borrowed = 0u64;
+        let amount = 4_000u64;
+
+        let new_reserve = reserve - amount;
+        let new_borrowed = borrowed + amount;
+
+        assert_eq!(new_reserve, 6_000);
+        assert_eq!(new_borrowed, 4_000);
+        // Effective unchanged.
+        assert_eq!(new_reserve + new_borrowed, reserve + borrowed);
+    }
+
+    #[test]
+    fn state_after_repay() {
+        let reserve = 6_000u64;
+        let borrowed = 4_000u64;
+        let amount = 2_000u64;
+
+        let new_reserve = reserve + amount;
+        let new_borrowed = borrowed - amount;
+
+        assert_eq!(new_reserve, 8_000);
+        assert_eq!(new_borrowed, 2_000);
+        assert_eq!(new_reserve + new_borrowed, reserve + borrowed);
+    }
+
+    #[test]
+    fn state_after_withdrawal_with_borrows() {
+        let total_shares = 1_000u64;
+        let reserve = 6_000u64;
+        let borrowed = 4_000u64;
+        let shares = 100u64;
+
+        let (from_vault, _, from_tee, _) =
+            compute_withdrawal(shares, total_shares, reserve, 0, borrowed, 0);
+
+        let new_reserve = reserve - from_vault;
+        let new_borrowed = borrowed - from_tee;
+        let new_total = total_shares - shares;
+
+        // Effective per share should remain constant (floor rounding aside).
+        let eff_before = (reserve + borrowed) as u128 * 10_000 / total_shares as u128;
+        let eff_after = (new_reserve + new_borrowed) as u128 * 10_000 / new_total as u128;
+        // Allow ±1 for rounding.
+        assert!((eff_before as i128 - eff_after as i128).unsigned_abs() <= 1);
+    }
+
+    #[test]
+    fn effective_per_share_stable_through_borrow_cycle() {
+        let total_shares = 1_000u64;
+        let initial_reserve = 10_000u64;
+
+        // Before borrow.
+        let eff0 = initial_reserve as u128 * 10_000 / total_shares as u128;
+
+        // After borrow 3000.
+        let reserve1 = initial_reserve - 3_000;
+        let borrowed1 = 3_000u64;
+        let eff1 = (reserve1 + borrowed1) as u128 * 10_000 / total_shares as u128;
+        assert_eq!(eff0, eff1);
+
+        // After repay 1000.
+        let reserve2 = reserve1 + 1_000;
+        let borrowed2 = borrowed1 - 1_000;
+        let eff2 = (reserve2 + borrowed2) as u128 * 10_000 / total_shares as u128;
+        assert_eq!(eff0, eff2);
+
+        // After withdrawal of 100 shares.
+        let (fv, _, ft, _) = compute_withdrawal(100, total_shares, reserve2, 0, borrowed2, 0);
+        let reserve3 = reserve2 - fv;
+        let borrowed3 = borrowed2 - ft;
+        let total3 = total_shares - 100;
+        let eff3 = (reserve3 + borrowed3) as u128 * 10_000 / total3 as u128;
+        assert!((eff0 as i128 - eff3 as i128).unsigned_abs() <= 1);
+    }
+
+    // -- Gap coverage: floor division safety ----------------------------------
+
+    #[test]
+    fn floor_split_never_exceeds_effective_payout() {
+        // For all tested cases: from_vault + from_tee <= shares * effective / total_shares.
+        let cases: Vec<(u64, u64, u64, u64)> = vec![
+            (333, 1_000, 7_777, 2_223),
+            (1, 3, 10, 5),
+            (999, 1_000, 1, 999_999),
+            (17, 31, 12_345, 67_890),
+            (1, 1_000_000, 999_999, 1),
+        ];
+        for (shares, total, reserve, borrowed) in cases {
+            let ts = total as u128;
+            let effective = (reserve as u128) + (borrowed as u128);
+            let effective_payout = ((shares as u128) * effective / ts) as u64;
+            let (fv, _, ft, _) = compute_withdrawal(shares, total, reserve, 0, borrowed, 0);
+            assert!(
+                fv + ft <= effective_payout,
+                "fv({fv}) + ft({ft}) > eff({effective_payout}) for shares={shares} total={total} res={reserve} bor={borrowed}"
+            );
+        }
+    }
+
+    // -- Gap coverage: zero reserve (everything borrowed to cap) ---------------
+
+    #[test]
+    fn withdraw_zero_reserve_all_from_tee() {
+        // reserve=0, borrowed=1000 (extreme case: vault empty).
+        let (fv_a, _, ft_a, _) = compute_withdrawal(500, 1_000, 0, 0, 1_000, 0);
+        assert_eq!(fv_a, 0);
+        assert_eq!(ft_a, 500);
+    }
+
+    #[test]
+    fn withdraw_near_zero_reserve() {
+        // reserve=1, borrowed=999 (almost all borrowed).
+        let (fv_a, _, ft_a, _) = compute_withdrawal(100, 1_000, 1, 0, 999, 0);
+        assert_eq!(fv_a, 0); // 100*1/1000 = 0 (floor)
+        assert_eq!(ft_a, 99); // 100*999/1000 = 99 (floor)
+    }
+
+    // -- Gap coverage: full drain by all LPs ----------------------------------
+
+    #[test]
+    fn full_drain_no_negative_dust() {
+        let mut total_shares = 1_000u64;
+        let mut reserve = 7_777u64;
+        let mut borrowed = 3_333u64;
+
+        // 10 LPs each with 100 shares withdraw sequentially.
+        for _ in 0..10 {
+            let (fv, _, ft, _) =
+                compute_withdrawal(100, total_shares, reserve, 0, borrowed, 0);
+            assert!(fv <= reserve, "from_vault exceeds reserve");
+            assert!(ft <= borrowed, "from_tee exceeds borrowed");
+            reserve -= fv;
+            borrowed -= ft;
+            total_shares -= 100;
+        }
+        assert_eq!(total_shares, 0);
+        // Dust must be non-negative (can't go below zero).
+        // Small dust is expected from floor rounding.
+        assert!(reserve <= 9, "reserve dust too large: {reserve}");
+        assert!(borrowed <= 9, "borrowed dust too large: {borrowed}");
+    }
+
+    #[test]
+    fn full_drain_unequal_shares() {
+        let mut total_shares = 1_000u64;
+        let mut reserve = 10_000u64;
+        let mut borrowed = 5_000u64;
+
+        let withdrawals = [100, 250, 50, 300, 200, 100];
+        for shares in withdrawals {
+            let (fv, _, ft, _) =
+                compute_withdrawal(shares, total_shares, reserve, 0, borrowed, 0);
+            assert!(fv <= reserve);
+            assert!(ft <= borrowed);
+            reserve -= fv;
+            borrowed -= ft;
+            total_shares -= shares;
+        }
+        assert_eq!(total_shares, 0);
+        assert!(reserve <= 5, "reserve dust: {reserve}");
+        assert!(borrowed <= 5, "borrowed dust: {borrowed}");
+    }
+
+    // -- Gap coverage: borrow cap rounding ------------------------------------
+
+    #[test]
+    fn borrow_cap_odd_effective_rounding() {
+        // effective=999, cap=50%. 999*5000/10000 = 499 (floor).
+        assert!(borrow_allowed(999, 0, 499, 5_000));
+        assert!(!borrow_allowed(999, 0, 500, 5_000));
+    }
+
+    #[test]
+    fn borrow_cap_one_lamport_boundary() {
+        // effective=1, cap=50%. 1*5000/10000 = 0 (floor). Can't borrow anything.
+        assert!(!borrow_allowed(1, 0, 1, 5_000));
+        // effective=2, cap=50%. 2*5000/10000 = 1.
+        assert!(borrow_allowed(2, 0, 1, 5_000));
+        assert!(!borrow_allowed(2, 0, 2, 5_000));
+    }
+
+    // -- Gap coverage: borrow → partial repay → re-borrow ---------------------
+
+    #[test]
+    fn borrow_repay_reborrow_cap_consistent() {
+        let initial_reserve = 10_000u64;
+        let max_bps = 5_000u16;
+
+        // Borrow 5000 (50% of effective 10000).
+        let borrow1 = 5_000u64;
+        assert!(borrow_allowed(initial_reserve, 0, borrow1, max_bps));
+        let reserve1 = initial_reserve - borrow1;
+        let borrowed1 = borrow1;
+
+        // Repay 2000.
+        let repay = 2_000u64;
+        let reserve2 = reserve1 + repay;
+        let borrowed2 = borrowed1 - repay;
+        // effective unchanged: 10000.
+
+        // Re-borrow: can borrow up to 5000 total → 2000 more.
+        assert!(borrow_allowed(reserve2, borrowed2, 2_000, max_bps));
+        assert!(!borrow_allowed(reserve2, borrowed2, 2_001, max_bps));
+    }
+
+    #[test]
+    fn borrow_full_repay_full_reborrow() {
+        let reserve = 10_000u64;
+        let max_bps = 5_000u16;
+
+        // Borrow max.
+        assert!(borrow_allowed(reserve, 0, 5_000, max_bps));
+        let r1 = reserve - 5_000;
+        let b1 = 5_000u64;
+
+        // Full repay.
+        let r2 = r1 + 5_000;
+        let b2 = b1 - 5_000;
+        assert_eq!(r2, reserve);
+        assert_eq!(b2, 0);
+
+        // Re-borrow max again.
+        assert!(borrow_allowed(r2, b2, 5_000, max_bps));
+    }
+
+    // -- Gap coverage: near-u64::MAX on both sides ----------------------------
+
+    #[test]
+    fn withdraw_both_sides_near_max() {
+        let big = u64::MAX / 4;
+        let (fv_a, fv_b, ft_a, ft_b) = compute_withdrawal(1, 2, big, big, big, big);
+        assert_eq!(fv_a, big / 2);
+        assert_eq!(fv_b, big / 2);
+        assert_eq!(ft_a, big / 2);
+        assert_eq!(ft_b, big / 2);
+    }
+
+    #[test]
+    fn withdraw_u128_multiplication_ceiling() {
+        // shares=u64::MAX, total=u64::MAX, reserve=u64::MAX.
+        // Result: u64::MAX * u64::MAX / u64::MAX = u64::MAX. No overflow in u128.
+        let m = u64::MAX;
+        let (fv_a, _, ft_a, _) = compute_withdrawal(m, m, m, 0, m, 0);
+        assert_eq!(fv_a, m);
+        assert_eq!(ft_a, m);
+    }
+
+    #[test]
+    fn withdraw_large_shares_small_total() {
+        // shares close to total, large reserves + borrows.
+        let total = 1_000_000u64;
+        let shares = 999_999u64;
+        let reserve = u64::MAX / 8;
+        let borrowed = u64::MAX / 8;
+        let (fv, _, ft, _) = compute_withdrawal(shares, total, reserve, 0, borrowed, 0);
+        // Should be very close to reserve/borrowed (off by ~reserve/1M).
+        let expected_fv = ((shares as u128) * (reserve as u128) / (total as u128)) as u64;
+        assert_eq!(fv, expected_fv);
+        let expected_ft = ((shares as u128) * (borrowed as u128) / (total as u128)) as u64;
+        assert_eq!(ft, expected_ft);
     }
 }

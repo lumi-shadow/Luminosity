@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-use crate::constants::SPENT_BITMAP_SHARD_BYTES;
+use crate::constants::{MERKLE_TREE_HEIGHT, ROOT_HISTORY_SIZE, SPENT_BITMAP_SHARD_BYTES};
 
 // -----------------------------------------------------------------------------
 // Events (logs)
@@ -15,7 +15,7 @@ pub struct DepositEvent {
     pub encrypted_note: Vec<u8>,
 }
 
-/// Swap event for append-only swap outputs (TEE path, legacy).
+/// Swap event for append-only swap outputs (TEE path).
 ///
 /// - Input leaf is tombstoned (replaced) using `replace_leaf`.
 /// - Output leaf is appended using `Append`.
@@ -26,8 +26,6 @@ pub struct SwapAppendEvent {
     pub input_leaf_index: u32,
     pub output_commitment: [u8; 32],
     pub output_leaf_index: u64,
-    pub new_reserve_a: u64,
-    pub new_reserve_b: u64,
     pub encrypted_note: Vec<u8>,
 }
 
@@ -45,10 +43,9 @@ pub struct ZkSwapEvent {
     pub amount_out: u64,
     pub asset_id_in: u32,
     pub asset_id_out: u32,
-    pub new_reserve_a: u64,
-    pub new_reserve_b: u64,
     pub encrypted_note: Vec<u8>,
 }
+
 
 // -----------------------------------------------------------------------------
 // Accounts (state)
@@ -90,6 +87,55 @@ pub struct SpentBitmapShard {
 
 impl SpentBitmapShard {
     pub const LEN: usize = SPENT_BITMAP_SHARD_BYTES;
+}
+
+/// v2 Poseidon append-only commitment tree state: filled-subtree cache (Light
+/// `SparseMerkleTree` fields) + a Tornado-style root-history ring buffer.
+/// `zero_copy` so the ~4 KB of subtree and root data is read/written in place
+/// without (de)serialization. Driven by [`crate::poseidon_merkle_tree::MerkleTree`].
+/// Additive — replaces the keccak `spl_concurrent_merkle_tree` path once
+/// instructions are wired to it.
+///
+/// `_padding` keeps the struct 8-byte aligned for `zero_copy` (Pod).
+#[account(zero_copy)]
+#[repr(C)]
+pub struct MerkleTreeAccount {
+    pub authority: Pubkey,
+    pub next_index: u64,
+    pub subtrees: [[u8; 32]; MERKLE_TREE_HEIGHT as usize],
+    pub root: [u8; 32],
+    pub root_history: [[u8; 32]; ROOT_HISTORY_SIZE],
+    pub root_index: u64,
+    pub height: u8,
+    pub root_history_size: u8,
+    pub bump: u8,
+    pub _padding: [u8; 5],
+}
+
+impl MerkleTreeAccount {
+    /// Account space = 8 (discriminator) + struct size.
+    pub const LEN: usize = 8 + std::mem::size_of::<MerkleTreeAccount>();
+}
+
+/// Spent-nullifier marker for the v2 (Poseidon) shielded path.
+///
+/// Existence of this account at PDA `[NULLIFIER_SEED, amm, nullifier]` means the
+/// corresponding note has been spent. It is created via Anchor `init` inside a
+/// (proof-verified) spend instruction, so a second spend of the same nullifier
+/// fails atomically — the PDA already exists. This replaces the leaf-index
+/// `SpentBitmapShard`, whose cleartext `leaf_index` linked spend -> deposit and
+/// collapsed the anonymity set. A Poseidon nullifier reveals nothing about which
+/// commitment is being spent.
+#[account]
+pub struct NullifierAccount {
+    /// Slot the nullifier was first recorded (indexing / audit ordering).
+    pub spent_at_slot: u64,
+    pub bump: u8,
+}
+
+impl NullifierAccount {
+    // 8 (discriminator) + 8 (spent_at_slot) + 1 (bump)
+    pub const LEN: usize = 8 + 8 + 1;
 }
 
 /// Lookup table entry: mint -> asset_id.
@@ -155,8 +201,15 @@ pub struct Pool {
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
     /// Canonical shared AMM vault ATA for mint_a (authority = AMM PDA).
+    ///
+    /// WARNING: this is only safe while the protocol operates a single pool per
+    /// mint pair and does not rely on per-pool vault isolation. Reusing the same
+    /// mint-level ATA across multiple pools or balance domains would couple their
+    /// solvency and create cross-pool liability leakage.
     pub vault_a: Pubkey,
     /// Canonical shared AMM vault ATA for mint_b (authority = AMM PDA).
+    ///
+    /// WARNING: same single-pool assumption as `vault_a` above.
     pub vault_b: Pubkey,
     /// Total outstanding LP shares for this pool (share-based liquidity notes).
     pub total_shares: u64,
@@ -164,7 +217,7 @@ pub struct Pool {
     pub reserve_a: u64,
     pub reserve_b: u64,
     pub bump: u8,
-    // --- V2 fields (ZK swap support) ---
+    // --- Oracle / PMM fields (required for ZK + clear swaps) ---
     /// Pyth push-oracle price account for mint_a.
     pub oracle_a: Pubkey,
     /// Pyth push-oracle price account for mint_b.
@@ -188,6 +241,33 @@ impl Pool {
     pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 32 + 8 + 8 + 8 + 1
         + 32 + 32 + 1 + 1 + 2
         + PmmConfig::SIZE;
+}
+
+/// Per-pool ledger tracking tokens borrowed by the TEE for external trading.
+///
+/// PDA seeds: `["borrow", pool.key()]`
+///
+/// Tracks outstanding borrows per pool.
+#[account]
+pub struct BorrowLedger {
+    pub pool: Pubkey,
+    pub borrowed_a: u64,
+    pub borrowed_b: u64,
+    /// Maximum borrow as basis points of effective reserves (hard cap: 8000 = 80%).
+    pub max_borrow_bps: u16,
+    pub bump: u8,
+}
+
+impl BorrowLedger {
+    // 8 (Discriminator)
+    // + 32 (pool)
+    // + 8 (borrowed_a) + 8 (borrowed_b)
+    // + 2 (max_borrow_bps)
+    // + 1 (bump)
+    pub const LEN: usize = 8 + 32 + 8 + 8 + 2 + 1;
+
+    /// Hard protocol cap — even admin cannot exceed 99% borrow.
+    pub const MAX_BPS: u16 = 9_900;
 }
 
 /// Lookup table entry: pool -> pool_id.

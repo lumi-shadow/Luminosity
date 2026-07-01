@@ -154,9 +154,30 @@ pub enum PrivacyError {
     #[msg("Relayer fee exceeds withdrawal amount")]
     FeeExceedsAmount,
 
+    // ---- Borrow / Recall ----
+    #[msg("Borrow would exceed max_borrow_bps cap for this pool")]
+    BorrowCapExceeded,
+    #[msg("Repay amount exceeds outstanding borrowed balance")]
+    NothingToRepay,
+    #[msg("Delegate transfer failed during LP withdrawal recall from TEE")]
+    RecallFailed,
+    #[msg("Borrow ledger does not belong to this pool")]
+    InvalidBorrowLedger,
+    #[msg("Borrow/repay amount must be non-zero on at least one side")]
+    NoOpBorrowRepay,
+    #[msg("TEE ATA balance insufficient to cover principal + accrued interest")]
+    InsufficientTeeBalance,
+
     // ---- General ----
     #[msg("Insufficient funds in the pool to pay out")]
     InsufficientPoolBalance,
     #[msg("Math overflow")]
     MathOverflow,
+    // ---- v2 Poseidon Merkle tree ---- (appended at END to preserve existing error codes)
+    #[msg("Merkle tree is full")]
+    MerkleTreeFull,
+    #[msg("Poseidon hash failed (input not a valid field element)")]
+    PoseidonHashFailed,
+    #[msg("Invalid Merkle tree configuration (height / root-history size)")]
+    InvalidTreeConfig,
 }

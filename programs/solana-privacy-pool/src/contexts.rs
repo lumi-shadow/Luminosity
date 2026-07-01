@@ -6,7 +6,7 @@
 //!   3. Deposits (asset + liquidity)
 //!   4. Withdrawals (asset + liquidity)
 //!   5. Swaps (RFQ / TEE + ZK / permissionless)
-//!   6. Migration helpers
+//!   6. Clear swaps (Jupiter RFQ / non-private settlement)
 
 use anchor_lang::prelude::*;
 use anchor_spl::{
@@ -98,12 +98,89 @@ pub struct RotateAdmin<'info> {
     pub admin: Signer<'info>,
 }
 
-/// Rotate the TEE / relayer authority key.
+/// Rotate the TEE authority with full borrow cleanup for one pool.
+///
+/// Recalls all borrowed tokens to the vault via the AMM PDA delegate (no old
+/// TEE signature needed — handles compromised key rotation). Zeros the
+/// borrow ledger, updates `amm.tee_authority`, and grants `u64::MAX`
+/// delegate on the new TEE's ATAs.
+///
+/// Signers: admin + new TEE.
 #[derive(Accounts)]
-pub struct RotateTeeAuthority<'info> {
+pub struct RotateTeeWithBorrowCleanup<'info> {
     #[account(mut, seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
     pub amm: Box<Account<'info, Amm>>,
+
     pub admin: Signer<'info>,
+
+    /// Incoming TEE authority — must sign to authorize delegate on its ATAs.
+    pub new_tee_authority: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = pool.amm == amm.key() @ PrivacyError::InvalidPoolAmm,
+    )]
+    pub pool: Box<Account<'info, Pool>>,
+
+    #[account(
+        mut,
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump = borrow_ledger.bump,
+        constraint = borrow_ledger.pool == pool.key() @ PrivacyError::InvalidBorrowLedger,
+    )]
+    pub borrow_ledger: Box<Account<'info, BorrowLedger>>,
+
+    #[account(
+        mut,
+        constraint = vault_a.key() == pool.vault_a @ PrivacyError::InvalidPoolVault,
+    )]
+    pub vault_a: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = vault_b.key() == pool.vault_b @ PrivacyError::InvalidPoolVault,
+    )]
+    pub vault_b: Box<Account<'info, TokenAccount>>,
+
+    /// Old TEE's ATA for mint_a — source for recall (AMM PDA is delegate).
+    #[account(
+        mut,
+        associated_token::authority = amm.tee_authority,
+        associated_token::mint = mint_a,
+    )]
+    pub old_tee_ata_a: Box<Account<'info, TokenAccount>>,
+
+    /// Old TEE's ATA for mint_b.
+    #[account(
+        mut,
+        associated_token::authority = amm.tee_authority,
+        associated_token::mint = mint_b,
+    )]
+    pub old_tee_ata_b: Box<Account<'info, TokenAccount>>,
+
+    /// New TEE's ATA for mint_a — delegate will be granted here.
+    #[account(
+        mut,
+        associated_token::authority = new_tee_authority,
+        associated_token::mint = mint_a,
+    )]
+    pub new_tee_ata_a: Box<Account<'info, TokenAccount>>,
+
+    /// New TEE's ATA for mint_b.
+    #[account(
+        mut,
+        associated_token::authority = new_tee_authority,
+        associated_token::mint = mint_b,
+    )]
+    pub new_tee_ata_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(address = pool.mint_a)]
+    pub mint_a: Box<Account<'info, Mint>>,
+
+    #[account(address = pool.mint_b)]
+    pub mint_b: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 /// Initialize the global Registry PDA.
@@ -125,6 +202,74 @@ pub struct InitializeRegistry<'info> {
     pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
+}
+
+/// Initialize the v2 Poseidon commitment tree (zero_copy). Admin-gated; the AMM
+/// PDA is recorded as the tree authority. Call once. Additive — runs alongside
+/// the legacy keccak SPL tree until the spend paths are migrated.
+#[derive(Accounts)]
+pub struct InitPoseidonTree<'info> {
+    #[account(seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
+    pub amm: Box<Account<'info, Amm>>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = MerkleTreeAccount::LEN,
+        seeds = [POSEIDON_TREE_SEED, amm.key().as_ref()],
+        bump,
+    )]
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Admin: zero one leaf of the legacy keccak SPL tree (one step of the vacuum
+/// that must precede `close_empty_tree`). Reuses the SPL `replace_leaf` CPI
+/// (which writes a zero leaf), signed by the AMM PDA (the tree authority).
+/// Merkle proof nodes are passed via `remaining_accounts`.
+#[derive(Accounts)]
+pub struct AdminVacuumKeccakLeaf<'info> {
+    #[account(seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
+    pub amm: Box<Account<'info, Amm>>,
+
+    /// CHECK: legacy SPL keccak tree (validated by owner + address).
+    #[account(
+        mut,
+        address = amm.merkle_tree,
+        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+    )]
+    pub merkle_tree: UncheckedAccount<'info>,
+
+    pub admin: Signer<'info>,
+    pub compression_program: Program<'info, SplCompression>,
+    pub noop: Program<'info, Noop>,
+}
+
+/// Admin: close the (already-zeroed) legacy keccak SPL tree and send its rent
+/// lamports to `rent_recipient`. Signed by the AMM PDA (the tree authority).
+#[derive(Accounts)]
+pub struct AdminCloseKeccakTree<'info> {
+    #[account(seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
+    pub amm: Box<Account<'info, Amm>>,
+
+    /// CHECK: legacy SPL keccak tree (validated by owner + address).
+    #[account(
+        mut,
+        address = amm.merkle_tree,
+        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+    )]
+    pub merkle_tree: UncheckedAccount<'info>,
+
+    /// CHECK: destination for the reclaimed rent lamports.
+    #[account(mut)]
+    pub rent_recipient: UncheckedAccount<'info>,
+
+    pub admin: Signer<'info>,
+    pub compression_program: Program<'info, SplCompression>,
 }
 
 // ===========================================================================
@@ -185,7 +330,7 @@ pub struct CreatePool<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Configure pool V2 fields (oracle feeds, fee, PMM policy). Admin-only.
+/// Configure pool oracle feeds, fee, and PMM policy. Admin-only.
 #[derive(Accounts)]
 pub struct ConfigurePool<'info> {
     #[account(seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
@@ -243,18 +388,15 @@ pub struct Deposit<'info> {
     )]
     pub user_source: Box<Account<'info, TokenAccount>>,
 
-    /// CHECK: SPL Compression tree (validated by owner + address).
     #[account(
         mut,
-        address = amm.merkle_tree,
-        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+        seeds = [POSEIDON_TREE_SEED, amm.key().as_ref()],
+        bump,
     )]
-    pub merkle_tree: UncheckedAccount<'info>,
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
-    pub compression_program: Program<'info, SplCompression>,
-    pub noop: Program<'info, Noop>,
     pub system_program: Program<'info, System>,
 }
 
@@ -276,6 +418,13 @@ pub struct DepositLiquidity<'info> {
         constraint = mint_a.key().to_bytes() < mint_b.key().to_bytes() @ PrivacyError::NonCanonicalMintOrder,
     )]
     pub pool: Box<Account<'info, Pool>>,
+
+    #[account(
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump = borrow_ledger.bump,
+        constraint = borrow_ledger.pool == pool.key() @ PrivacyError::InvalidBorrowLedger,
+    )]
+    pub borrow_ledger: Box<Account<'info, BorrowLedger>>,
 
     #[account(
         mut,
@@ -316,18 +465,15 @@ pub struct DepositLiquidity<'info> {
     )]
     pub user_account_b: Box<Account<'info, TokenAccount>>,
 
-    /// CHECK: SPL Compression tree.
     #[account(
         mut,
-        address = amm.merkle_tree,
-        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+        seeds = [POSEIDON_TREE_SEED, amm.key().as_ref()],
+        bump,
     )]
-    pub merkle_tree: UncheckedAccount<'info>,
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
-    pub compression_program: Program<'info, SplCompression>,
-    pub noop: Program<'info, Noop>,
     pub system_program: Program<'info, System>,
 }
 
@@ -384,12 +530,11 @@ pub struct Withdraw<'info> {
     )]
     pub spent_shard: Box<Account<'info, SpentBitmapShard>>,
 
-    /// CHECK: SPL Compression tree.
     #[account(
-        address = amm.merkle_tree,
-        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+        seeds = [POSEIDON_TREE_SEED, amm.key().as_ref()],
+        bump,
     )]
-    pub merkle_tree: UncheckedAccount<'info>,
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -459,16 +604,41 @@ pub struct WithdrawLiquidity<'info> {
     )]
     pub spent_shard: Box<Account<'info, SpentBitmapShard>>,
 
-    /// CHECK: SPL Compression tree.
+    #[account(
+        seeds = [POSEIDON_TREE_SEED, amm.key().as_ref()],
+        bump,
+    )]
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
+
+    // -- Borrow-aware accounts --
+
+    /// Borrow ledger for the pool. Required to prevent caller-side omission
+    /// from underpaying LP withdrawals when borrows are active.
     #[account(
         mut,
-        address = amm.merkle_tree,
-        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump = borrow_ledger.bump,
+        constraint = borrow_ledger.pool == pool.key() @ PrivacyError::InvalidBorrowLedger,
     )]
-    pub merkle_tree: UncheckedAccount<'info>,
+    pub borrow_ledger: Box<Account<'info, BorrowLedger>>,
+
+    /// TEE ATA for mint_a — required when borrow_ledger has active borrows.
+    #[account(
+        mut,
+        associated_token::authority = amm.tee_authority,
+        associated_token::mint = mint_a,
+    )]
+    pub tee_ata_a: Option<Box<Account<'info, TokenAccount>>>,
+
+    /// TEE ATA for mint_b — required when borrow_ledger has active borrows.
+    #[account(
+        mut,
+        associated_token::authority = amm.tee_authority,
+        associated_token::mint = mint_b,
+    )]
+    pub tee_ata_b: Option<Box<Account<'info, TokenAccount>>>,
 
     pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
@@ -490,13 +660,12 @@ pub struct ExecuteRfqSwapAppend<'info> {
     #[account(address = config.tee_authority @ PrivacyError::UnauthorizedTEE)]
     pub tee_authority: Signer<'info>,
 
-    /// CHECK: SPL Compression tree.
     #[account(
         mut,
-        address = config.merkle_tree,
-        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+        seeds = [POSEIDON_TREE_SEED, config.key().as_ref()],
+        bump,
     )]
-    pub merkle_tree: UncheckedAccount<'info>,
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
 
     #[account(mut, constraint = pool.amm == config.key() @ PrivacyError::InvalidPoolAmm)]
     pub pool: Account<'info, Pool>,
@@ -526,10 +695,7 @@ pub struct ExecuteRfqSwapAppend<'info> {
     pub spent_shard: Box<Account<'info, SpentBitmapShard>>,
 
     pub token_program: Program<'info, Token>,
-    pub compression_program: Program<'info, SplCompression>,
-    pub noop: Program<'info, Noop>,
     pub system_program: Program<'info, System>,
-    // Merkle proof nodes via `remaining_accounts`.
 }
 
 /// Permissionless ZK swap (Path C) – on-chain PMM pricing via Pyth oracles.
@@ -551,13 +717,12 @@ pub struct ExecuteZkSwap<'info> {
     #[account(seeds = [b"registry"], bump)]
     pub registry: Box<Account<'info, Registry>>,
 
-    /// CHECK: SPL Compression Merkle tree.
     #[account(
         mut,
-        address = config.merkle_tree,
-        owner = SplCompression::id() @ PrivacyError::InvalidTreeOwner,
+        seeds = [POSEIDON_TREE_SEED, config.key().as_ref()],
+        bump,
     )]
-    pub merkle_tree: UncheckedAccount<'info>,
+    pub merkle_tree: AccountLoader<'info, MerkleTreeAccount>,
 
     #[account(
         constraint = amm_vault_a.key() == pool.vault_a @ PrivacyError::InvalidPoolVault,
@@ -591,39 +756,174 @@ pub struct ExecuteZkSwap<'info> {
     pub spent_shard: Box<Account<'info, SpentBitmapShard>>,
 
     pub token_program: Program<'info, Token>,
-    pub compression_program: Program<'info, SplCompression>,
-    pub noop: Program<'info, Noop>,
     pub system_program: Program<'info, System>,
-    // Merkle proof nodes via `remaining_accounts`.
 }
 
 // ===========================================================================
-//  6. MIGRATION
+//  6. BORROW / REPAY (TEE liquidity borrowing)
 // ===========================================================================
 
-/// Migrate a V1 Pool account to V2 (adds oracle / PMM fields).
-///
-/// Uses `UncheckedAccount` for the pool because V1 accounts are too short for
-/// Anchor to deserialize as the new `Pool` struct. Discriminator + AMM key +
-/// mint keys + owner are all validated manually in the handler.
+/// Initialize a per-pool borrow ledger. Admin-only.
 #[derive(Accounts)]
-pub struct MigratePoolV2<'info> {
+pub struct InitBorrowLedger<'info> {
     #[account(seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
     pub amm: Box<Account<'info, Amm>>,
 
-    /// CHECK: Pool PDA to migrate – validated manually in the handler
-    /// (discriminator, amm key, mint_a/b keys, and program ownership).
-    #[account(
-        mut,
-        owner = crate::ID @ PrivacyError::InvalidPoolAmm,
-    )]
-    pub pool: UncheckedAccount<'info>,
+    #[account(constraint = pool.amm == amm.key() @ PrivacyError::InvalidPoolAmm)]
+    pub pool: Box<Account<'info, Pool>>,
 
-    pub mint_a: Box<Account<'info, Mint>>,
-    pub mint_b: Box<Account<'info, Mint>>,
+    #[account(
+        init,
+        payer = admin,
+        space = BorrowLedger::LEN,
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump,
+    )]
+    pub borrow_ledger: Account<'info, BorrowLedger>,
 
     #[account(mut)]
     pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
+
+/// Borrow tokens from pool vaults to the TEE wallet.
+#[derive(Accounts)]
+pub struct Borrow<'info> {
+    #[account(seeds = [b"amm"], bump)]
+    pub amm: Box<Account<'info, Amm>>,
+
+    #[account(address = amm.tee_authority @ PrivacyError::UnauthorizedTEE)]
+    pub tee_authority: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = pool.amm == amm.key() @ PrivacyError::InvalidPoolAmm,
+    )]
+    pub pool: Box<Account<'info, Pool>>,
+
+    #[account(
+        mut,
+        constraint = vault_a.key() == pool.vault_a @ PrivacyError::InvalidPoolVault,
+    )]
+    pub vault_a: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = vault_b.key() == pool.vault_b @ PrivacyError::InvalidPoolVault,
+    )]
+    pub vault_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::authority = tee_authority,
+        associated_token::mint = mint_a,
+    )]
+    pub tee_ata_a: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::authority = tee_authority,
+        associated_token::mint = mint_b,
+    )]
+    pub tee_ata_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump = borrow_ledger.bump,
+        constraint = borrow_ledger.pool == pool.key() @ PrivacyError::InvalidBorrowLedger,
+    )]
+    pub borrow_ledger: Account<'info, BorrowLedger>,
+
+    #[account(address = pool.mint_a)]
+    pub mint_a: Box<Account<'info, Mint>>,
+
+    #[account(address = pool.mint_b)]
+    pub mint_b: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+/// Repay borrowed tokens / pay interest from TEE wallet back to pool vaults.
+///
+/// Also used as the context for `pay_interest`.
+#[derive(Accounts)]
+pub struct Repay<'info> {
+    #[account(seeds = [b"amm"], bump)]
+    pub amm: Box<Account<'info, Amm>>,
+
+    #[account(address = amm.tee_authority @ PrivacyError::UnauthorizedTEE)]
+    pub tee_authority: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = pool.amm == amm.key() @ PrivacyError::InvalidPoolAmm,
+    )]
+    pub pool: Box<Account<'info, Pool>>,
+
+    #[account(
+        mut,
+        constraint = vault_a.key() == pool.vault_a @ PrivacyError::InvalidPoolVault,
+    )]
+    pub vault_a: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        constraint = vault_b.key() == pool.vault_b @ PrivacyError::InvalidPoolVault,
+    )]
+    pub vault_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::authority = tee_authority,
+        associated_token::mint = mint_a,
+    )]
+    pub tee_ata_a: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::authority = tee_authority,
+        associated_token::mint = mint_b,
+    )]
+    pub tee_ata_b: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump = borrow_ledger.bump,
+        constraint = borrow_ledger.pool == pool.key() @ PrivacyError::InvalidBorrowLedger,
+    )]
+    pub borrow_ledger: Account<'info, BorrowLedger>,
+
+    #[account(address = pool.mint_a)]
+    pub mint_a: Box<Account<'info, Mint>>,
+
+    #[account(address = pool.mint_b)]
+    pub mint_b: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+/// Update the max borrow cap on a borrow ledger. Admin-only.
+#[derive(Accounts)]
+pub struct SetMaxBorrowBps<'info> {
+    #[account(seeds = [b"amm"], bump, has_one = admin @ PrivacyError::UnauthorizedAdmin)]
+    pub amm: Box<Account<'info, Amm>>,
+
+    pub admin: Signer<'info>,
+
+    #[account(constraint = pool.amm == amm.key() @ PrivacyError::InvalidPoolAmm)]
+    pub pool: Box<Account<'info, Pool>>,
+
+    #[account(
+        mut,
+        seeds = [b"borrow", pool.key().as_ref()],
+        bump = borrow_ledger.bump,
+        constraint = borrow_ledger.pool == pool.key() @ PrivacyError::InvalidBorrowLedger,
+    )]
+    pub borrow_ledger: Account<'info, BorrowLedger>,
+}
+
